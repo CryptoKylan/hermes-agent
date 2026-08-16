@@ -1122,7 +1122,7 @@ def run_claude_agent_sdk_turn(
         "api_calls": int(getattr(turn, "api_call_made", True)),
         "completed": not turn.interrupted and turn.error is None,
         "partial": turn.interrupted or turn.error is not None,
-        "error": turn.error,
+        "error": redact_sensitive_text(str(turn.error or ""), force=True) if turn.error else None,
         "interrupted": _user_interrupted,
         # Same persistence contract as the codex app-server path: we flushed
         # the projected rows ourselves, so the gateway must not re-write the

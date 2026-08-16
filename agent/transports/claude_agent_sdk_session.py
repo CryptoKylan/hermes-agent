@@ -1085,8 +1085,9 @@ class ClaudeAgentSdkSession:
                     trip = None
         except Exception as exc:
             self._interrupt_event.clear()
-            hint = classify_auth_failure(str(exc))
-            result.error = hint or f"claude-agent-sdk turn failed: {exc}"
+            safe_exc = _safe_sdk_error_text(exc)
+            hint = classify_auth_failure(safe_exc)
+            result.error = hint or f"claude-agent-sdk turn failed: {safe_exc}"
             result.should_retire = True
             if hint is not None:
                 # Auth failures are fatal; other mid-turn exceptions stay
