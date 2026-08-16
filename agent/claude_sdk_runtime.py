@@ -18,6 +18,8 @@ import os
 import threading
 from typing import Any, Dict, List, Optional
 
+from agent.redact import redact_sensitive_text
+
 logger = logging.getLogger(__name__)
 
 # Cap per persona/memory source so the append can't blow the context budget
@@ -961,7 +963,10 @@ def run_claude_agent_sdk_turn(
         try:
             turn = agent._claude_sdk_session.run_turn(user_input=send_input)
         except Exception as exc:
-            logger.exception("claude-agent-sdk turn failed")
+            safe_exc = redact_sensitive_text(str(exc), force=True)
+            # Do not use logger.exception here: it appends the raw exception
+            # string after the redacted message to the log record.
+            logger.error("claude-agent-sdk turn failed: %s", safe_exc)
             try:
                 agent._claude_sdk_session.close()
             except Exception:
@@ -974,7 +979,7 @@ def run_claude_agent_sdk_turn(
                 resumed = False
                 continue
             return {
-                "final_response": f"claude-agent-sdk turn failed: {exc}",
+                "final_response": f"claude-agent-sdk turn failed: {safe_exc}",
                 "messages": messages,
                 "api_calls": 0,
                 "completed": False,
@@ -984,12 +989,13 @@ def run_claude_agent_sdk_turn(
                 # partial — mark it failed so one-shot runs exit nonzero
                 # (mirrors conversation_loop's generic non-retryable return).
                 "failed": True,
-                "error": str(exc),
+                "error": safe_exc,
             }
 
         if getattr(turn, "should_retire", False):
             logger.warning(
-                "claude-agent-sdk session retired (turn error: %s)", turn.error
+                "claude-agent-sdk session retired (turn error: %s)",
+                redact_sensitive_text(str(turn.error or ""), force=True),
             )
             try:
                 agent._claude_sdk_session.close()

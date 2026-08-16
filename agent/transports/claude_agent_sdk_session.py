@@ -35,6 +35,7 @@ from typing import Any, Callable, Optional
 # TurnResult is the shared contract with the runtime glue — reused verbatim
 # from the codex session module (same fields, same semantics) so
 # ``run_claude_agent_sdk_turn`` mirrors ``run_codex_app_server_turn`` 1:1.
+from agent.redact import redact_sensitive_text
 from agent.transports.codex_app_server_session import TurnResult
 from agent.transports.claude_sdk_event_projector import ClaudeSdkEventProjector
 
@@ -394,10 +395,13 @@ def _http_mcp_entries_from_config() -> dict[str, dict]:
                 name,
             )
             continue
-        decoded_url_fields = _unquote(f"{parsed.query};{parsed.fragment}")
-        if parsed.username is not None or _secret_field_re.search(decoded_url_fields):
+        # Direct HTTP MCP configuration is passed to the SDK/CLI process.
+        # Treat every query, fragment, or userinfo component as secret-bearing:
+        # a denylist cannot safely distinguish signed/public query parameters
+        # from encoded credentials (including nested percent encoding).
+        if parsed.username is not None or parsed.query or parsed.fragment:
             logger.warning(
-                "claude-agent-sdk: refusing HTTP MCP %r because its URL may contain credentials",
+                "claude-agent-sdk: refusing HTTP MCP %r because its URL has userinfo, query, or fragment",
                 name,
             )
             continue
@@ -449,7 +453,10 @@ def classify_auth_failure(
         if (needle is None and matched_401) or (
             needle is not None and needle in haystack
         ):
-            original = next((p.strip() for p in parts if p and p.strip()), "")
+            original = redact_sensitive_text(
+                next((p.strip() for p in parts if p and p.strip()), ""),
+                force=True,
+            )
             if len(original) > 400:
                 original = original[:400] + "…"
             return (
@@ -1110,10 +1117,10 @@ class ClaudeAgentSdkSession:
             # next turn on this session object.
             self._interrupt_event.clear()
         if turn_data["error"]:
-            hint = classify_auth_failure(
-                turn_data["error"],
-                mcp_attributed=turn_data["mcp_tool_seen"],
-            )
+            # A prior MCP tool use is not evidence that this terminal SDK
+            # error belongs to MCP; preserve fail-closed Claude auth handling
+            # unless the error text itself identifies an MCP origin.
+            hint = classify_auth_failure(turn_data["error"])
             result.error = hint or turn_data["error"]
             if hint is not None:
                 result.should_retire = True
@@ -1343,10 +1350,7 @@ class ClaudeAgentSdkSession:
                         if (
                             interrupted
                             and subtype == "error_during_execution"
-                            and classify_auth_failure(
-                                err_text,
-                                mcp_attributed=out["mcp_tool_seen"],
-                            ) is None
+                            and classify_auth_failure(err_text) is None
                         ):
                             logger.info(
                                 "claude-agent-sdk: masked %s on requested "

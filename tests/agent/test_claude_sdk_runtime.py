@@ -266,12 +266,13 @@ class TestAuthClassifier:
         assert hint is not None
         assert "setup-token" in hint
 
-    def test_hint_preserves_underlying_error(self):
-        # A hit RETIRES the session, so the true error must survive in the
-        # message — a misclassification that also swallows the evidence is
-        # undebuggable.
-        hint = classify_auth_failure("HTTP 401 unauthorized: oauth token expired")
+    def test_hint_redacts_underlying_error(self):
+        hint = classify_auth_failure(
+            "HTTP 401 unauthorized: oauth token expired; Authorization: Bearer sk-secret-test-token"
+        )
+        assert hint is not None
         assert "401 unauthorized" in hint
+        assert "sk-secret-test-token" not in hint
 
     def test_negative_control_ordinary_error_no_hint(self):
         # RED-first: an unrelated failure must surface verbatim, never as a
@@ -442,7 +443,7 @@ class TestSession:
         assert usable.error is None
         assert holder["client"].queried == ["normal turn"]
 
-    def test_mcp_provenance_prevents_unlabeled_terminal_401_retirement(self):
+    def test_successful_mcp_use_does_not_mask_terminal_401(self):
         session, _ = _make_session(script=[
             AssistantMessage(content=[
                 ToolUseBlock(
@@ -464,8 +465,8 @@ class TestSession:
         finally:
             session.close()
         assert "HTTP 401" in (turn.error or "")
-        assert not turn.should_retire
-        assert turn.fatal_reason is None
+        assert turn.should_retire
+        assert turn.fatal_reason == "auth"
 
     @pytest.mark.parametrize("mcp_tool", [True, False])
     def test_interrupted_auth_result_respects_mcp_provenance(self, mcp_tool):
@@ -505,14 +506,11 @@ class TestSession:
         finally:
             session.close()
         assert turn.interrupted
-        if mcp_tool:
-            assert turn.error is None
-            assert not turn.should_retire
-            assert turn.fatal_reason is None
-        else:
-            assert "setup-token" in (turn.error or "")
-            assert turn.should_retire
-            assert turn.fatal_reason == "auth"
+        # A successful MCP call is not provenance for a later terminal Claude
+        # auth failure, including when the user interrupts the turn.
+        assert "setup-token" in (turn.error or "")
+        assert turn.should_retire
+        assert turn.fatal_reason == "auth"
 
     def test_quota_429_contradictory_success_surfaces_result_for_fallback(self):
         session, _ = _make_session(script=[ResultMessage(
@@ -1237,6 +1235,8 @@ class TestHttpMcpSecurity:
             "https://mcp.example.test/mcp?apikey=value",
             "https://mcp.example.test/mcp?token=value",
             "https://mcp.example.test/mcp?%74oken=value",
+            "https://mcp.example.test/mcp?%2574oken=value",
+            "https://mcp.example.test/mcp?signature=value",
             "https://mcp.example.test/mcp#authorization=value",
             "https://mcp.example.test/mcp#%61uth=value",
         ],
