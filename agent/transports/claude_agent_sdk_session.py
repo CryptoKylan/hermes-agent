@@ -433,6 +433,11 @@ _AUTH_UNAUTHORIZED_HTTP_401_RE = re.compile(
 )
 
 
+def _safe_sdk_error_text(value: Any) -> str:
+    """Redact provider/SDK diagnostics before they cross a transport boundary."""
+    return redact_sensitive_text(str(value or ""), force=True)
+
+
 def classify_auth_failure(
     *parts: str, mcp_attributed: bool = False
 ) -> Optional[str]:
@@ -453,9 +458,8 @@ def classify_auth_failure(
         if (needle is None and matched_401) or (
             needle is not None and needle in haystack
         ):
-            original = redact_sensitive_text(
-                next((p.strip() for p in parts if p and p.strip()), ""),
-                force=True,
+            original = _safe_sdk_error_text(
+                next((p.strip() for p in parts if p and p.strip()), "")
             )
             if len(original) > 400:
                 original = original[:400] + "…"
@@ -919,8 +923,9 @@ class ClaudeAgentSdkSession:
         try:
             self.ensure_started()
         except Exception as exc:
-            hint = classify_auth_failure(str(exc))
-            result.error = hint or f"claude-agent-sdk startup failed: {exc}"
+            safe_exc = _safe_sdk_error_text(exc)
+            hint = classify_auth_failure(safe_exc)
+            result.error = hint or f"claude-agent-sdk startup failed: {safe_exc}"
             result.should_retire = True
             # A refusal to start is fatal to the run, not turn-scoped: the
             # metered-key guard and an uninstallable SDK are config errors
@@ -1196,7 +1201,7 @@ class ClaudeAgentSdkSession:
         ended = self._stream_ended
         if ended is not None:
             out["error"] = "SDK message stream ended before this turn" + (
-                f": {ended.error}" if ended.error else ""
+                f": {_safe_sdk_error_text(ended.error)}" if ended.error else ""
             )
             out["stream_ended"] = True
             return out
@@ -1222,7 +1227,7 @@ class ClaudeAgentSdkSession:
                 if isinstance(message, _StreamEnd):
                     out["error"] = (
                         "SDK message stream ended before this turn's result"
-                        + (f": {message.error}" if message.error else "")
+                        + (f": {_safe_sdk_error_text(message.error)}" if message.error else "")
                     )
                     out["stream_ended"] = True
                     break
@@ -1327,9 +1332,11 @@ class ClaudeAgentSdkSession:
                                 message,
                             )
                             break
-                        detail = "; ".join(str(e) for e in errors) or getattr(
-                            message, "result", None
-                        ) or subtype
+                        detail = _safe_sdk_error_text(
+                            "; ".join(str(e) for e in errors)
+                            or getattr(message, "result", None)
+                            or subtype
+                        )
                         err_text = f"SDK result error (subtype={subtype}): {detail}"
                         if api_error_status:
                             err_text += f" (HTTP {api_error_status})"
@@ -1436,8 +1443,11 @@ class ClaudeAgentSdkSession:
         except asyncio.CancelledError:  # pragma: no cover - shutdown path
             raise
         except Exception as exc:  # pragma: no cover - stream torn down
-            logger.debug("claude-agent-sdk reader loop ended", exc_info=True)
-            end = _StreamEnd(error=repr(exc))
+            logger.debug(
+                "claude-agent-sdk reader loop ended: %s",
+                _safe_sdk_error_text(exc),
+            )
+            end = _StreamEnd(error=_safe_sdk_error_text(exc))
         else:
             end = _StreamEnd(error=None)
         # The stream is gone (CLI exited or transport died). Mark it for any
