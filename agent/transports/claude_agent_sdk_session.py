@@ -304,8 +304,11 @@ def _swallow_interrupt_result(future: Any) -> None:
     at teardown — retrieve and demote it."""
     try:
         future.result()
-    except Exception:
-        logger.debug("SDK interrupt control request failed", exc_info=True)
+    except Exception as exc:
+        logger.debug(
+            "SDK interrupt control request failed: %s",
+            _safe_sdk_error_text(exc),
+        )
 
 
 def _http_mcp_entries_from_config() -> dict[str, dict]:
@@ -880,8 +883,11 @@ class ClaudeAgentSdkSession:
                     self._client.interrupt(), self._loop
                 )
                 future.add_done_callback(_swallow_interrupt_result)
-            except Exception:  # pragma: no cover
-                logger.debug("SDK interrupt scheduling failed", exc_info=True)
+            except Exception as exc:  # pragma: no cover
+                logger.debug(
+                    "SDK interrupt scheduling failed: %s",
+                    _safe_sdk_error_text(exc),
+                )
 
     # ---------- per-turn ----------
 
@@ -1329,8 +1335,7 @@ class ClaudeAgentSdkSession:
                             logger.warning(
                                 "claude-agent-sdk: contradictory result "
                                 "envelope (is_error=True, subtype=success, "
-                                "no errors) — treated as success: %r",
-                                message,
+                                "no errors) — treated as success (diagnostic omitted)",
                             )
                             break
                         detail = _safe_sdk_error_text(
@@ -1363,7 +1368,9 @@ class ClaudeAgentSdkSession:
                             logger.info(
                                 "claude-agent-sdk: masked %s on requested "
                                 "interrupt (interrupt honored, not a "
-                                "failure): %s", subtype, err_text,
+                                "failure): %s",
+                                subtype,
+                                _safe_sdk_error_text(err_text),
                             )
                         else:
                             out["error"] = err_text
