@@ -579,7 +579,7 @@ def _configured_max_budget_usd() -> Optional[float]:
 def run_claude_agent_sdk_turn(
     agent,
     *,
-    user_message: str,
+    user_message: Any,
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,
@@ -597,7 +597,34 @@ def run_claude_agent_sdk_turn(
       error/timeout retire      → id CLEARED → next turn fresh + digest
       stale/failed resume       → retire → clear → ONE fresh retry with digest
     """
-    from agent.transports.claude_agent_sdk_session import ClaudeAgentSdkSession
+    from agent.transports.claude_agent_sdk_session import (
+        ClaudeAgentSdkSession,
+        _coerce_turn_input,
+    )
+
+    user_input = _coerce_turn_input(user_message)
+    if isinstance(user_input, str) and not user_input.strip():
+        agent._interrupt_requested = False
+        live_session = getattr(agent, "_claude_sdk_session", None)
+        if live_session is not None:
+            try:
+                live_session.consume_interrupt()
+            except Exception:
+                logger.debug("consume_interrupt failed", exc_info=True)
+        rejection = (
+            "This Claude Agent SDK route can't process an empty message. "
+            "Please send text or a supported image."
+        )
+        return {
+            "final_response": rejection,
+            "messages": messages,
+            "api_calls": 0,
+            "completed": False,
+            "partial": True,
+            "error": rejection,
+            "interrupted": False,
+            "agent_persisted": True,
+        }
 
     # P1.b: refresh the approval-context snapshot EVERY turn (including
     # session-reuse turns). This runs on the agent turn thread, where the
@@ -913,20 +940,26 @@ def run_claude_agent_sdk_turn(
 
     turn = None
     resumed = False
-    send_text = user_message
+    send_input = user_input
     for attempt in (0, 1):
         if not hasattr(agent, "_claude_sdk_session") or agent._claude_sdk_session is None:
             resume_id = _persisted_sdk_session_id(agent) if attempt == 0 else None
             resumed = bool(resume_id)
-            send_text = user_message
+            send_input = user_input
             if not resume_id and len(messages) > 1:
                 digest = _render_continuity_digest(messages[:-1])
                 if digest:
-                    send_text = digest + user_message
+                    if isinstance(user_input, list):
+                        send_input = [
+                            {"type": "text", "text": digest},
+                            *user_input,
+                        ]
+                    else:
+                        send_input = digest + user_input
             _create_session(resume_id)
 
         try:
-            turn = agent._claude_sdk_session.run_turn(user_input=send_text)
+            turn = agent._claude_sdk_session.run_turn(user_input=send_input)
         except Exception as exc:
             logger.exception("claude-agent-sdk turn failed")
             try:
@@ -1032,7 +1065,11 @@ def run_claude_agent_sdk_turn(
     agent._iters_since_skill = (
         getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
     )
-    usage_result = _record_claude_sdk_usage(agent, turn)
+    usage_result = (
+        _record_claude_sdk_usage(agent, turn)
+        if getattr(turn, "api_call_made", True)
+        else {}
+    )
 
     should_review_skills = False
     if (
@@ -1076,7 +1113,7 @@ def run_claude_agent_sdk_turn(
     result = {
         "final_response": turn.final_text,
         "messages": messages,
-        "api_calls": 1,
+        "api_calls": int(getattr(turn, "api_call_made", True)),
         "completed": not turn.interrupted and turn.error is None,
         "partial": turn.interrupted or turn.error is not None,
         "error": turn.error,

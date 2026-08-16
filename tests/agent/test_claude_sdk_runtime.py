@@ -298,6 +298,41 @@ class TestAuthClassifier:
             is None
         )
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "HTTP 401: Unauthorized",
+            "request failed: status code 401, Unauthorized",
+            "request failed: status code 401 - Unauthorized",
+            "request failed: status code 401 (Unauthorized)",
+            "request failed: status code 401\nUnauthorized",
+            "SDK result error: Unauthorized (HTTP 401)",
+        ],
+    )
+    def test_delimited_401_is_auth_failure(self, message):
+        assert classify_auth_failure(message) is not None
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "mcp__calendar failed: HTTP 401 Unauthorized",
+            'mcp__calendar failed: {"type":"authentication_error"}',
+            "mcp server failed: invalid api key",
+            "mcp__tool failed; Anthropic OAuth error: HTTP 401 Unauthorized",
+        ],
+    )
+    def test_mcp_auth_payload_is_not_claude_auth_failure(self, message):
+        assert classify_auth_failure(message) is None
+
+    def test_structured_mcp_provenance_suppresses_unlabeled_auth_payload(self):
+        assert (
+            classify_auth_failure(
+                "HTTP 401 Unauthorized: authentication_error",
+                mcp_attributed=True,
+            )
+            is None
+        )
+
 
 # ---------- session (fake client) ----------
 
@@ -391,6 +426,94 @@ def _make_session(script=None, connect_exc=None, **kwargs):
 
 
 class TestSession:
+    def test_empty_turn_rejects_before_start_and_following_turn_works(self):
+        session, holder = _make_session(script=[ResultMessage(result="usable")])
+        session.request_interrupt()
+        try:
+            for content in ([], "", "   "):
+                turn = session.run_turn(content)
+                assert turn.error == turn.final_text
+                assert turn.api_call_made is False
+                assert not turn.should_retire
+            assert holder == {}
+            usable = session.run_turn("normal turn")
+        finally:
+            session.close()
+        assert usable.error is None
+        assert holder["client"].queried == ["normal turn"]
+
+    def test_mcp_provenance_prevents_unlabeled_terminal_401_retirement(self):
+        session, _ = _make_session(script=[
+            AssistantMessage(content=[
+                ToolUseBlock(
+                    id="mcp-1",
+                    name="mcp__calendar__list_events",
+                    input={},
+                )
+            ]),
+            ResultMessage(
+                result="",
+                errors=["HTTP 401 Unauthorized"],
+                is_error=True,
+                subtype="error_during_execution",
+                api_error_status=401,
+            ),
+        ])
+        try:
+            turn = session.run_turn("list events")
+        finally:
+            session.close()
+        assert "HTTP 401" in (turn.error or "")
+        assert not turn.should_retire
+        assert turn.fatal_reason is None
+
+    @pytest.mark.parametrize("mcp_tool", [True, False])
+    def test_interrupted_auth_result_respects_mcp_provenance(self, mcp_tool):
+        script = []
+        if mcp_tool:
+            script.append(AssistantMessage(content=[
+                ToolUseBlock(
+                    id="mcp-1",
+                    name="mcp__calendar__list_events",
+                    input={},
+                )
+            ]))
+        script.append(ResultMessage(
+            result="",
+            errors=["HTTP 401 Unauthorized"],
+            is_error=True,
+            subtype="error_during_execution",
+            api_error_status=401,
+        ))
+        session, _ = _make_session(script=script)
+        original_factory = session._client_factory
+
+        def interrupting_factory(*args, **kwargs):
+            client = original_factory(*args, **kwargs)
+            original_query = client.query
+
+            async def query_then_interrupt(text):
+                await original_query(text)
+                session._interrupt_event.set()
+
+            client.query = query_then_interrupt
+            return client
+
+        session._client_factory = interrupting_factory
+        try:
+            turn = session.run_turn("list events")
+        finally:
+            session.close()
+        assert turn.interrupted
+        if mcp_tool:
+            assert turn.error is None
+            assert not turn.should_retire
+            assert turn.fatal_reason is None
+        else:
+            assert "setup-token" in (turn.error or "")
+            assert turn.should_retire
+            assert turn.fatal_reason == "auth"
+
     def test_quota_429_contradictory_success_surfaces_result_for_fallback(self):
         session, _ = _make_session(script=[ResultMessage(
             result="You've hit your session limit", is_error=True,
@@ -818,6 +941,113 @@ class TestRuntimeGlue:
         # Skill-nudge counter parity with the codex path.
         assert agent._iters_since_skill == 2
 
+    def test_empty_rich_input_rejects_before_digest_or_session_creation(self):
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        result = run_claude_agent_sdk_turn(
+            agent,
+            user_message=[],
+            original_user_message=[],
+            messages=[
+                {"role": "assistant", "content": "prior answer"},
+                {"role": "user", "content": []},
+            ],
+            effective_task_id="task-1",
+        )
+        assert result["api_calls"] == 0
+        assert result["partial"] is True
+        assert result["interrupted"] is False
+        assert agent._claude_sdk_session is None
+
+    def test_empty_rejection_consumes_interrupts_and_next_turn_runs(self):
+        agent = _make_agent()
+        session = agent._claude_sdk_session
+        agent._interrupt_requested = True
+        rejected = run_claude_agent_sdk_turn(
+            agent,
+            user_message="   ",
+            original_user_message="   ",
+            messages=[{"role": "user", "content": "   "}],
+            effective_task_id="task-1",
+        )
+        assert rejected["api_calls"] == 0
+        assert agent._interrupt_requested is False
+        session.consume_interrupt.assert_called_once()
+        session.run_turn.assert_not_called()
+
+        accepted = run_claude_agent_sdk_turn(
+            agent,
+            user_message="continue",
+            original_user_message="continue",
+            messages=[{"role": "user", "content": "continue"}],
+            effective_task_id="task-2",
+        )
+        assert accepted["api_calls"] == 1
+        session.run_turn.assert_called_once_with(user_input="continue")
+
+    def test_native_image_with_continuity_digest_preserves_blocks(
+        self, monkeypatch
+    ):
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        seen = {}
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                pass
+
+            def run_turn(self, user_input):
+                seen["input"] = user_input
+                return _make_turn()
+
+        monkeypatch.setattr(sdk_session_mod, "ClaudeAgentSdkSession", SpySession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        image = {
+            "type": "image_url",
+            "image_url": {"url": "https://example.test/photo.png"},
+        }
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message=[image],
+            original_user_message=[image],
+            messages=[
+                {"role": "assistant", "content": "prior answer"},
+                {"role": "user", "content": [image]},
+            ],
+            effective_task_id="task-1",
+        )
+        assert seen["input"][0]["type"] == "text"
+        assert "continuity" in seen["input"][0]["text"].lower()
+        assert seen["input"][1] == {
+            "type": "image",
+            "source": {
+                "type": "url",
+                "url": "https://example.test/photo.png",
+            },
+        }
+
+    def test_transport_local_result_is_visible_without_usage_count(self):
+        agent = _make_agent()
+        agent._claude_sdk_session.run_turn.return_value = _make_turn(
+            api_call_made=False,
+            error="local rejection",
+            final_text="local rejection",
+            projected_messages=[],
+            token_usage_last=None,
+        )
+        result = run_claude_agent_sdk_turn(
+            agent,
+            user_message="non-empty local input",
+            original_user_message="non-empty local input",
+            messages=[{"role": "user", "content": "non-empty local input"}],
+            effective_task_id="task-1",
+        )
+        assert result["final_response"] == "local rejection"
+        assert result["api_calls"] == 0
+        assert result["partial"] is True
+        assert agent.session_api_calls == 0
+
     def test_retire_closes_session(self):
         agent = _make_agent()
         agent._claude_sdk_session.run_turn.return_value = _make_turn(
@@ -880,6 +1110,34 @@ class TestBackgroundReviewSuppressed:
 
 
 class TestHttpMcpSecurity:
+    @pytest.fixture(autouse=True)
+    def _enable_direct_http_opt_in(self, monkeypatch):
+        from agent.transports import claude_agent_sdk_session as mod
+
+        monkeypatch.setattr(
+            mod,
+            "_provider_config",
+            lambda: {"hybrid_mcp_bridge": True},
+        )
+
+    def test_helper_is_default_off_even_when_called_directly(
+        self, monkeypatch, tmp_path
+    ):
+        from agent.transports import claude_agent_sdk_session as mod
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "mcp_servers:\n  public:\n    url: https://mcp.example.test\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(mod, "_provider_config", lambda: {})
+        monkeypatch.setattr(
+            mod,
+            "_configured_hybrid_exclude",
+            MagicMock(side_effect=AssertionError("must not read exclusions")),
+        )
+        assert mod._http_mcp_entries_from_config() == {}
+
     def test_default_off_never_discovers_direct_http_servers(self, monkeypatch):
         from agent.transports import claude_agent_sdk_session as mod
 
@@ -953,7 +1211,7 @@ class TestHttpMcpSecurity:
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("HERMES_PROFILE", "test")
-        monkeypatch.delenv("MISSING_MCP_HOST", raising=False)
+        monkeypatch.setenv("MISSING_MCP_HOST", "expanded-secret-host")
         (tmp_path / "config.yaml").write_text(
             """mcp_servers:
   broken-search:
@@ -968,6 +1226,98 @@ class TestHttpMcpSecurity:
         assert entries == {}
         assert "broken-search" in caplog.text
         assert "https:///mcp" not in caplog.text
+        assert "expanded-secret-host" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://mcp.example.test/${lowercase_secret}/mcp",
+            "https://user:password@mcp.example.test/mcp",
+            "https://mcp.example.test/mcp?api-key=value",
+            "https://mcp.example.test/mcp?apikey=value",
+            "https://mcp.example.test/mcp?token=value",
+            "https://mcp.example.test/mcp?%74oken=value",
+            "https://mcp.example.test/mcp#authorization=value",
+            "https://mcp.example.test/mcp#%61uth=value",
+        ],
+    )
+    def test_templated_or_credential_bearing_url_is_refused(
+        self, monkeypatch, tmp_path, url
+    ):
+        from agent.transports.claude_agent_sdk_session import (
+            _http_mcp_entries_from_config,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            f"mcp_servers:\n  private:\n    url: {url}\n",
+            encoding="utf-8",
+        )
+        assert _http_mcp_entries_from_config() == {}
+
+    def test_truthy_non_mapping_headers_are_refused(self, monkeypatch, tmp_path):
+        from agent.transports.claude_agent_sdk_session import (
+            _http_mcp_entries_from_config,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "mcp_servers:\n  malformed:\n    url: https://mcp.example.test\n"
+            "    headers: bearer-secret\n",
+            encoding="utf-8",
+        )
+        assert _http_mcp_entries_from_config() == {}
+
+    def test_http_server_name_honors_exclusion(self, monkeypatch, tmp_path):
+        from agent.transports import claude_agent_sdk_session as mod
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            mod,
+            "_provider_config",
+            lambda: {
+                "hybrid_mcp_bridge": True,
+                "hybrid_mcp_bridge_exclude": ["public-search"],
+            },
+        )
+        (tmp_path / "config.yaml").write_text(
+            "mcp_servers:\n  public-search:\n"
+            "    url: https://mcp.example.test\n",
+            encoding="utf-8",
+        )
+        assert mod._http_mcp_entries_from_config() == {}
+
+    def test_hermes_tools_collision_preserves_hybrid_entry(
+        self, monkeypatch, tmp_path
+    ):
+        from agent.transports import hermes_hybrid_mcp
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "mcp_servers:\n"
+            "  hermes-tools:\n    url: https://mcp.example.test/collision\n"
+            "  public:\n    url: https://mcp.example.test/public\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            hermes_hybrid_mcp,
+            "build_hybrid_mcp_server",
+            lambda *args, server_name, **kwargs: {
+                "type": "sdk",
+                "name": server_name,
+            },
+        )
+        session = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            agent=object(),
+            tools={"read_file": object()},
+        )
+        fields = session.build_option_fields()
+        assert fields["mcp_servers"]["hermes-tools"]["type"] == "sdk"
+        assert fields["mcp_servers"]["public"] == {
+            "type": "http",
+            "url": "https://mcp.example.test/public",
+        }
 
 
 # ---------- hermes session id plumbing to the MCP shims (#26567) ----------

@@ -93,6 +93,9 @@ class TurnResult:
     # chat_completions path does and one-shot CLI runs exit nonzero.
     # Transient turn errors (timeout, in-turn SDK error) leave it None.
     fatal_reason: Optional[str] = None
+    # ``False`` for transport-local rejections that never reached a model
+    # client; runtime glue must not count or persist them as API calls.
+    api_call_made: bool = True
 
 
 # Markers we accept as terminal even when codex never emits turn/completed.

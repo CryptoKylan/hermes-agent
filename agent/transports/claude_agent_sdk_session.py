@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -307,31 +308,17 @@ def _swallow_interrupt_result(future: Any) -> None:
 
 
 def _http_mcp_entries_from_config() -> dict[str, dict]:
-    """Return third-party HTTP MCPs discovered in Hermes' merged config, in
-    the McpHttpServerConfig shape the SDK wants ({"type": "http", "url": ...}).
+    """Return explicitly opted-in, credential-free HTTP MCPs for the SDK.
 
-    Reads (in order, later overrides earlier) ``$HERMES_HOME/config.yaml``
-    then ``$HERMES_HOME/profiles/<profile>/config.yaml`` and pulls every
-    ``mcp_servers.<name>`` entry that carries a ``url:`` field (i.e. HTTP
-    MCPs). ``${...}`` env placeholders in the URL are resolved against the
-    gateway process env. Header-bearing entries are refused: the SDK
-    serializes its MCP config into the Claude CLI's ``--mcp-config`` process
-    argument, so forwarding a resolved Authorization header would expose the
-    secret to local process inspection. Entries without a valid resolved
-    HTTP(S) URL (stdio subprocess, in-process, missing env placeholder) are
-    ignored without logging the URL. Returns ``{}`` on any read/parse failure
-    — the caller keeps working with just the hybrid + stdio wrapper.
-
-    Rationale: HTTP MCPs registered in Hermes end up in the registry under a
-    toolset ``mcp-<name>`` that isn't included in the agent's default enabled
-    toolsets, so ``get_tool_definitions()`` returns them behind tool_search's
-    tier-2 deferral — the hybrid bridge (which snapshots ``agent.tools`` at
-    session build) never sees them. Exposing them straight to the SDK client
-    bypasses the whole toolset-filter path.
+    Direct registration shares the ``hybrid_mcp_bridge`` opt-in and exclusion
+    list. Header-bearing, templated, userinfo-bearing, and credential-like
+    query or fragment URLs are refused because the SDK serializes this config
+    into the Claude CLI's ``--mcp-config`` process argument. Returns ``{}`` on
+    any read/parse failure and never logs a URL or credential value.
     """
     import os as _os
     import re as _re
-    from urllib.parse import urlsplit as _urlsplit
+    from urllib.parse import unquote as _unquote, urlsplit as _urlsplit
 
     try:
         import yaml as _yaml  # type: ignore
@@ -359,45 +346,62 @@ def _http_mcp_entries_from_config() -> dict[str, dict]:
             logger.debug("failed to read %s for HTTP MCP discovery", p, exc_info=True)
             continue
 
-    _env_re = _re.compile(r"\$\{([A-Z0-9_]+)\}")
+    if not _provider_flag("hybrid_mcp_bridge", default=False):
+        return {}
 
-    def _resolve_env(s: str) -> str:
-        return _env_re.sub(lambda m: _os.environ.get(m.group(1), ""), s)
+    _env_re = _re.compile(r"\$\{[^}]*\}")
+    _secret_field_re = _re.compile(
+        r"(?:api[_-]?key|token|secret|password|credential|authorization|auth)",
+        _re.I,
+    )
+    excluded_names = set(_configured_hybrid_exclude())
 
     out: dict[str, dict] = {}
-    for name, cfg in merged.items():
+    for raw_name, cfg in merged.items():
         if not isinstance(cfg, dict):
             continue
         url = cfg.get("url")
         if not isinstance(url, str) or not url.strip():
             continue
-        headers = cfg.get("headers")
-        if isinstance(headers, dict) and headers:
-            # Never resolve or log header values. ClaudeAgentOptions passes
-            # mcp_servers through `--mcp-config <json>`, making every value
-            # visible in the child process argv. Dropping the headers and
-            # connecting anonymously would be a misleading auth downgrade;
-            # refuse the whole server instead.
+        name = str(raw_name)
+        url = url.strip()
+        if name in excluded_names:
+            logger.info("claude-agent-sdk: HTTP MCP %r excluded by config", name)
+            continue
+        if cfg.get("headers"):
             logger.warning(
-                "claude-agent-sdk: refusing HTTP MCP %r because it requires "
-                "headers that the SDK would expose in process arguments",
-                str(name),
+                "claude-agent-sdk: refusing HTTP MCP %r because it has headers",
+                name,
             )
             continue
-        resolved = _resolve_env(url).strip()
-        parsed = _urlsplit(resolved)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            # Missing env placeholders commonly produce `https:///path`.
-            # Do not hand malformed config to the child or log the resolved
-            # URL: it may itself contain credentials.
+        if _env_re.search(url):
             logger.warning(
-                "claude-agent-sdk: refusing HTTP MCP %r because its resolved "
-                "URL is not a valid HTTP(S) endpoint",
-                str(name),
+                "claude-agent-sdk: refusing HTTP MCP %r because its URL is templated",
+                name,
             )
             continue
-        entry: dict[str, Any] = {"type": "http", "url": resolved}
-        out[str(name)] = entry
+        try:
+            parsed = _urlsplit(url)
+        except ValueError:
+            logger.warning(
+                "claude-agent-sdk: refusing HTTP MCP %r because its URL is malformed",
+                name,
+            )
+            continue
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            logger.warning(
+                "claude-agent-sdk: refusing HTTP MCP %r because its URL is not HTTP(S)",
+                name,
+            )
+            continue
+        decoded_url_fields = _unquote(f"{parsed.query};{parsed.fragment}")
+        if parsed.username is not None or _secret_field_re.search(decoded_url_fields):
+            logger.warning(
+                "claude-agent-sdk: refusing HTTP MCP %r because its URL may contain credentials",
+                name,
+            )
+            continue
+        out[name] = {"type": "http", "url": url}
     return out
 
 
@@ -412,7 +416,6 @@ _AUTH_FAILURE_HINTS = (
     "please run /login",
     "invalid api key",
     "authentication_error",
-    "401 unauthorized",
     "oauth token",
     "token has expired",
     "expired token",
@@ -420,8 +423,15 @@ _AUTH_FAILURE_HINTS = (
     "setup-token",
 )
 
+_AUTH_401_UNAUTHORIZED_RE = re.compile(r"\b401\W{0,3}unauthorized\b")
+_AUTH_UNAUTHORIZED_HTTP_401_RE = re.compile(
+    r"\bunauthorized\W{0,15}\(?http\s*401\b"
+)
 
-def classify_auth_failure(*parts: str) -> Optional[str]:
+
+def classify_auth_failure(
+    *parts: str, mcp_attributed: bool = False
+) -> Optional[str]:
     """Return a user-friendly re-auth hint if the strings look like a Claude
     subscription auth failure; otherwise None. The hint keeps the underlying
     error text: a hit retires the session, so the evidence must survive the
@@ -429,8 +439,16 @@ def classify_auth_failure(*parts: str) -> Optional[str]:
     haystack = " ".join(p for p in parts if p).lower()
     if not haystack:
         return None
-    for needle in _AUTH_FAILURE_HINTS:
-        if needle in haystack:
+    if mcp_attributed or "mcp__" in haystack or "mcp server" in haystack:
+        return None
+    matched_401 = (
+        _AUTH_401_UNAUTHORIZED_RE.search(haystack)
+        or _AUTH_UNAUTHORIZED_HTTP_401_RE.search(haystack)
+    )
+    for needle in (None, *_AUTH_FAILURE_HINTS):
+        if (needle is None and matched_401) or (
+            needle is not None and needle in haystack
+        ):
             original = next((p.strip() for p in parts if p and p.strip()), "")
             if len(original) > 400:
                 original = original[:400] + "…"
@@ -881,6 +899,16 @@ class ClaudeAgentSdkSession:
         the partial transcript and the resumable session id (no retire);
         only a grace expiry hard-cancels and retires."""
         result = TurnResult()
+        prompt = _coerce_turn_input(user_input)
+        if isinstance(prompt, str) and not prompt.strip():
+            self._interrupt_event.clear()
+            result.final_text = (
+                "This Claude Agent SDK route can't process an empty message. "
+                "Please send text or a supported image."
+            )
+            result.error = result.final_text
+            result.api_call_made = False
+            return result
         try:
             self.ensure_started()
         except Exception as exc:
@@ -919,7 +947,6 @@ class ClaudeAgentSdkSession:
             self._interrupt_event.clear()
             result.interrupted = True
             return result
-        prompt = _coerce_turn_input(user_input)
 
         import concurrent.futures
 
@@ -1083,7 +1110,10 @@ class ClaudeAgentSdkSession:
             # next turn on this session object.
             self._interrupt_event.clear()
         if turn_data["error"]:
-            hint = classify_auth_failure(turn_data["error"])
+            hint = classify_auth_failure(
+                turn_data["error"],
+                mcp_attributed=turn_data["mcp_tool_seen"],
+            )
             result.error = hint or turn_data["error"]
             if hint is not None:
                 result.should_retire = True
@@ -1154,6 +1184,7 @@ class ClaudeAgentSdkSession:
             "result_uuid": None,
             "model": None,
             "stream_ended": False,
+            "mcp_tool_seen": False,
         }
         ended = self._stream_ended
         if ended is not None:
@@ -1210,6 +1241,12 @@ class ClaudeAgentSdkSession:
                     if not interrupted:
                         self._forward_stream_delta(message)
                     continue
+                for block in getattr(message, "content", None) or []:
+                    if (
+                        type(block).__name__ == "ToolUseBlock"
+                        and str(getattr(block, "name", "")).startswith("mcp__")
+                    ):
+                        out["mcp_tool_seen"] = True
                 if not interrupted:
                     self._notify_tool_started(message)
                     self._notify_interim_assistant(message)
@@ -1306,7 +1343,10 @@ class ClaudeAgentSdkSession:
                         if (
                             interrupted
                             and subtype == "error_during_execution"
-                            and classify_auth_failure(err_text) is None
+                            and classify_auth_failure(
+                                err_text,
+                                mcp_attributed=out["mcp_tool_seen"],
+                            ) is None
                         ):
                             logger.info(
                                 "claude-agent-sdk: masked %s on requested "
