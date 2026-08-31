@@ -130,6 +130,16 @@ _RUNTIME_STATE_AUTH_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# TRANSITIONAL COMPATIBILITY (remove after all frozen candidate databases have
+# crossed the generic-runtime-state migration window): the candidate that
+# preceded AgentRuntime v1 stored its Claude SDK resume id directly on the
+# ``sessions`` row.  Keep the exact runtime identity and column name in one
+# small allowlist.  No other legacy column is eligible for automatic import.
+_LEGACY_CLAUDE_RUNTIME_ID = "hermes-claude-agent-sdk"
+_LEGACY_CLAUDE_SESSION_COLUMN = "claude_sdk_session_id"
+_LEGACY_CLAUDE_STATE_SCHEMA_VERSION = 1
+_LEGACY_CLAUDE_STATE_KEY = "external_session_id"
+
 
 def _validate_runtime_id(runtime_id: Any) -> str:
     """Validate the stable, provider-neutral runtime identity."""
@@ -14605,6 +14615,129 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     # ── AgentRuntime v1 state and usage ───────────────────────────────────
 
+    @staticmethod
+    def _runtime_state_from_row(row: sqlite3.Row) -> RuntimeStateEnvelope:
+        """Validate and decode a runtime state row returned from SQLite."""
+        stored_runtime_id = _validate_runtime_id(row["runtime_id"])
+        schema_version = row["schema_version"]
+        if (
+            not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version <= 0
+        ):
+            raise ValueError("stored runtime state has an invalid schema_version")
+        return RuntimeStateEnvelope(
+            runtime_id=stored_runtime_id,
+            schema_version=schema_version,
+            state=_decode_runtime_state(row["state_json"]),
+        )
+
+    def _legacy_claude_session_column_exists(self) -> bool:
+        """Return whether this database came from the frozen Claude candidate.
+
+        The current host schema deliberately does not declare the candidate's
+        provider-specific column.  Inspecting the live table first lets the
+        compatibility reader work on both shapes without broadening
+        ``SCHEMA_SQL`` or issuing a speculative SELECT against a missing
+        column.
+        """
+        with self._read_ctx() as conn:
+            columns = conn.execute('PRAGMA table_info("sessions")').fetchall()
+        return any(
+            (row["name"] if isinstance(row, sqlite3.Row) else row[1])
+            == _LEGACY_CLAUDE_SESSION_COLUMN
+            for row in columns
+        )
+
+    def _import_legacy_claude_sdk_session_state(
+        self, session_id: str
+    ) -> Optional[RuntimeStateEnvelope]:
+        """Import one frozen-candidate Claude SDK id into generic state.
+
+        This is intentionally a one-way, additive reader: it never updates,
+        clears, or removes the legacy column.  The generic row is inserted
+        only when the exact Claude runtime key is absent, and the check plus
+        insert share one write transaction so concurrent readers cannot
+        overwrite a state envelope written by the runtime.
+
+        TRANSITIONAL COMPATIBILITY: remove this method and its constants once
+        every supported candidate database has crossed the migration window.
+        Until then, plugin removal leaves the imported generic row inert; no
+        SDK import or provider policy lives in the host.
+        """
+        if self.read_only or not self._legacy_claude_session_column_exists():
+            return None
+
+        def _do(conn):
+            existing = conn.execute(
+                """SELECT runtime_id, schema_version, state_json
+                     FROM runtime_session_state
+                    WHERE session_id = ? AND runtime_id = ?""",
+                (session_id, _LEGACY_CLAUDE_RUNTIME_ID),
+            ).fetchone()
+            if existing is not None:
+                return existing
+
+            legacy = conn.execute(
+                """SELECT claude_sdk_session_id
+                     FROM sessions
+                    WHERE id = ?""",
+                (session_id,),
+            ).fetchone()
+            if legacy is None:
+                return None
+            legacy_session_id = (
+                legacy["claude_sdk_session_id"]
+                if isinstance(legacy, sqlite3.Row)
+                else legacy[0]
+            )
+            if legacy_session_id is None:
+                return None
+            try:
+                # Treat the old value as an opaque identifier, not as a
+                # provider payload.  Printable, bounded text is all the
+                # generic state contract needs to preserve safely.
+                legacy_session_id = _validate_runtime_text(
+                    legacy_session_id,
+                    _LEGACY_CLAUDE_SESSION_COLUMN,
+                )
+                # sqlite3 binds text as UTF-8.  Reject lone surrogates here so
+                # malformed legacy bytes cannot escape the compatibility
+                # boundary as a driver-level encoding failure.
+                legacy_session_id.encode("utf-8")
+                state_json = _encode_runtime_state(
+                    {_LEGACY_CLAUDE_STATE_KEY: legacy_session_id}
+                )
+            except (UnicodeEncodeError, ValueError):
+                logger.warning(
+                    "Skipping transitional Claude SDK state import for "
+                    "one session: legacy value is not a bounded opaque id",
+                )
+                return None
+
+            conn.execute(
+                """INSERT INTO runtime_session_state (
+                       session_id, runtime_id, schema_version, state_json,
+                       updated_at
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    _LEGACY_CLAUDE_RUNTIME_ID,
+                    _LEGACY_CLAUDE_STATE_SCHEMA_VERSION,
+                    state_json,
+                    time.time(),
+                ),
+            )
+            return conn.execute(
+                """SELECT runtime_id, schema_version, state_json
+                     FROM runtime_session_state
+                    WHERE session_id = ? AND runtime_id = ?""",
+                (session_id, _LEGACY_CLAUDE_RUNTIME_ID),
+            ).fetchone()
+
+        row = self._execute_write(_do)
+        return self._runtime_state_from_row(row) if row is not None else None
+
     def update_runtime_state(
         self, session_id: str, state: RuntimeStateEnvelope
     ) -> None:
@@ -14649,7 +14782,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def get_runtime_state(
         self, session_id: str, runtime_id: str
     ) -> Optional[RuntimeStateEnvelope]:
-        """Read one runtime state envelope, or ``None`` when it is absent."""
+        """Read one runtime state envelope, or ``None`` when it is absent.
+
+        The exact transitional Claude runtime identity also performs a
+        one-way import from the frozen candidate's optional session column
+        when no generic row exists.  Other runtime reads remain pure and the
+        current schema never gains that provider-specific column.
+        """
         if not isinstance(session_id, str) or not session_id:
             return None
         runtime_id = _validate_runtime_id(runtime_id)
@@ -14661,20 +14800,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id, runtime_id),
             ).fetchone()
         if row is None:
+            if runtime_id == _LEGACY_CLAUDE_RUNTIME_ID:
+                return self._import_legacy_claude_sdk_session_state(session_id)
             return None
-        stored_runtime_id = _validate_runtime_id(row["runtime_id"])
-        schema_version = row["schema_version"]
-        if (
-            not isinstance(schema_version, int)
-            or isinstance(schema_version, bool)
-            or schema_version <= 0
-        ):
-            raise ValueError("stored runtime state has an invalid schema_version")
-        return RuntimeStateEnvelope(
-            runtime_id=stored_runtime_id,
-            schema_version=schema_version,
-            state=_decode_runtime_state(row["state_json"]),
-        )
+        return self._runtime_state_from_row(row)
 
     def record_runtime_usage_receipt(
         self, session_id: str, receipt: RuntimeUsageReceipt
