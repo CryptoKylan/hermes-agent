@@ -8,10 +8,16 @@ import pytest
 
 from agent.runtime_api import (
     RuntimeApprovalRequestEvent,
+    RuntimeCancelledEvent,
     RuntimeCompactionEvent,
     RuntimeCompactionPhase,
+    CompactionOwnership,
     RuntimeCompletedEvent,
     RuntimeEventKind,
+    RuntimeFailedEvent,
+    RuntimeFailure,
+    RuntimeFailurePhase,
+    RuntimeDescriptor,
     RuntimeSelection,
     RuntimeStateEnvelope,
     RuntimeStateEvent,
@@ -34,6 +40,7 @@ class _HostServices:
         self.statuses = []
         self.states = []
         self.receipts = []
+        self.compactions = []
 
     async def execute_tool(self, name, arguments):
         raise AssertionError("not used")
@@ -49,6 +56,9 @@ class _HostServices:
 
     async def persist_usage(self, receipt):
         self.receipts.append(receipt)
+
+    async def emit_compaction(self, event):
+        self.compactions.append(event)
 
     def cancellation_requested(self):
         return False
@@ -294,4 +304,155 @@ def test_dispatch_closes_runtime_once_after_success():
     assert [receipt.billing_mode for receipt in host.receipts] == [
         "subscription_included"
     ]
+    assert runtime.close_calls == 1
+
+
+class _FailedRuntime:
+    def __init__(self):
+        self.close_calls = 0
+
+    def preflight(self, request):
+        return None
+
+    async def run_turn(self, request, host) -> AsyncIterator[object]:
+        yield RuntimeFailedEvent(
+            failure=RuntimeFailure(
+                code="synthetic_failure",
+                message="synthetic failure",
+                phase=RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT,
+                replay_safe=False,
+                retryable=True,
+            )
+        )
+
+    async def close(self):
+        self.close_calls += 1
+
+
+def test_dispatch_returns_classified_failure_without_authorizing_fallback():
+    runtime = _FailedRuntime()
+
+    result = run_runtime_sync(runtime, _request(), _HostServices())
+
+    assert result.failure is not None
+    assert result.failure.phase is RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT
+    assert result.failure.replay_safe is False
+    assert result.replay_safe is False
+    assert isinstance(result.terminal, RuntimeFailedEvent)
+    assert runtime.close_calls == 1
+
+
+class _ExplodingRuntime:
+    def __init__(self):
+        self.close_calls = 0
+
+    def preflight(self, request):
+        return None
+
+    async def run_turn(self, request, host) -> AsyncIterator[object]:
+        raise RuntimeError("synthetic transport failure")
+        yield  # pragma: no cover
+
+    async def close(self):
+        self.close_calls += 1
+
+
+def test_unclassified_runtime_exception_is_fail_closed_and_closes_once():
+    runtime = _ExplodingRuntime()
+
+    result = run_runtime_sync(runtime, _request(), _HostServices())
+
+    assert result.failure is not None
+    assert result.failure.code == "runtime_exception"
+    assert result.failure.phase is RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT
+    assert result.failure.replay_safe is False
+    assert runtime.close_calls == 1
+
+
+class _CompactingRuntime:
+    def __init__(self):
+        self.close_calls = 0
+
+    def preflight(self, request):
+        return None
+
+    async def run_turn(self, request, host) -> AsyncIterator[object]:
+        yield RuntimeCompactionEvent(
+            phase=RuntimeCompactionPhase.STARTED,
+            details={"watchdog_seconds": 30},
+        )
+        yield RuntimeCompactionEvent(phase=RuntimeCompactionPhase.COMPLETED)
+        yield RuntimeCompletedEvent(result={"final_response": "done"})
+
+    async def close(self):
+        self.close_calls += 1
+
+
+def test_runtime_compaction_events_are_projected_and_recorded_before_completion():
+    runtime = _CompactingRuntime()
+    host = _HostServices()
+
+    result = run_runtime_sync(runtime, _request(), host)
+
+    assert [event.phase for event in host.compactions] == [
+        RuntimeCompactionPhase.STARTED,
+        RuntimeCompactionPhase.COMPLETED,
+    ]
+    assert [event.phase for event in result.events if isinstance(event, RuntimeCompactionEvent)] == [
+        RuntimeCompactionPhase.STARTED,
+        RuntimeCompactionPhase.COMPLETED,
+    ]
+    assert runtime.close_calls == 1
+
+
+def test_host_owned_compaction_rejects_runtime_compaction_event():
+    runtime = _CompactingRuntime()
+    descriptor = RuntimeDescriptor(
+        runtime_id="host-owned-runtime",
+        plugin_version="0.1.0",
+        runtime_api_min=1,
+        runtime_api_max=1,
+        required_host_capabilities=frozenset(),
+        provider_ids=frozenset({"example"}),
+        api_modes=frozenset({"example_runtime"}),
+        session_state_schema_version=1,
+        compaction_ownership=CompactionOwnership.HOST,
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="host owns compaction"):
+        run_runtime_sync(
+            runtime,
+            _request(),
+            _HostServices(),
+            descriptor=descriptor,
+        )
+
+    assert runtime.close_calls == 1
+
+
+class _CancelledRuntime:
+    def __init__(self):
+        self.close_calls = 0
+
+    def preflight(self, request):
+        return None
+
+    async def run_turn(self, request, host) -> AsyncIterator[object]:
+        yield RuntimeCancelledEvent(reason="synthetic cancellation")
+
+    async def close(self):
+        self.close_calls += 1
+
+
+def test_runtime_cancellation_is_one_terminal_outcome_and_closes_once():
+    runtime = _CancelledRuntime()
+
+    result = run_runtime_sync(runtime, _request(), _HostServices())
+
+    assert result.cancelled is True
+    assert isinstance(result.terminal, RuntimeCancelledEvent)
+    assert sum(
+        isinstance(event, (RuntimeCompletedEvent, RuntimeCancelledEvent, RuntimeFailedEvent))
+        for event in result.events
+    ) == 1
     assert runtime.close_calls == 1

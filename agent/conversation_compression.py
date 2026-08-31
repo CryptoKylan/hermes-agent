@@ -76,6 +76,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
+from agent.runtime_api import CompactionOwnership
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 
 logger = logging.getLogger(__name__)
@@ -110,6 +111,29 @@ COMPACTION_STATUS = (
 )
 
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
+
+
+def runtime_compaction_ownership(agent: Any) -> CompactionOwnership | None:
+    """Return this turn's descriptor-derived compaction ownership.
+
+    A normal conversation sets ``_runtime_compaction_ownership`` immediately
+    after descriptor resolution. ``None`` deliberately means no runtime
+    descriptor is active, preserving direct/manual compression compatibility
+    for older callers that still use the legacy Codex route.
+    """
+    descriptor = getattr(agent, "_runtime_descriptor", None)
+    if descriptor is not None:
+        value = getattr(descriptor, "compaction_ownership", None)
+    else:
+        value = getattr(agent, "_runtime_compaction_ownership", None)
+    if isinstance(value, CompactionOwnership):
+        return value
+    if isinstance(value, str):
+        try:
+            return CompactionOwnership(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _strip_marker_for_comparison(msgs: Any) -> Any:
@@ -3143,7 +3167,22 @@ def compress_context(
     checkpoint_required = (
         getattr(agent, "compression_checkpoint_required", False) is True
     )
-    if getattr(agent, "api_mode", None) == "codex_app_server":
+    ownership = runtime_compaction_ownership(agent)
+    # A descriptor-owned runtime-native compressor must not accidentally cause
+    # Hermes to rewrite its transcript. The built-in Codex path retains its
+    # established manual/forced compaction adapter; external runtime-native
+    # implementations own the operation and only emit lifecycle events.
+    if ownership is CompactionOwnership.RUNTIME_NATIVE and getattr(
+        agent, "api_mode", None
+    ) != "codex_app_server":
+        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+        if not existing_prompt:
+            existing_prompt = agent._build_system_prompt(system_message)
+        return messages, existing_prompt
+    if (
+        getattr(agent, "api_mode", None) == "codex_app_server"
+        and ownership in (None, CompactionOwnership.RUNTIME_NATIVE)
+    ):
         if checkpoint_required:
             raise _checkpoint_blocked(
                 "codex_app_server owns the authoritative thread and does not "

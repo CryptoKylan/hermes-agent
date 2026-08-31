@@ -281,6 +281,8 @@ class RuntimeHostServices(Protocol):
 
     async def persist_usage(self, receipt: RuntimeUsageReceipt) -> None: ...
 
+    async def emit_compaction(self, event: RuntimeCompactionEvent) -> None: ...
+
     def cancellation_requested(self) -> bool: ...
 
 
@@ -363,6 +365,10 @@ def validate_runtime_descriptor(descriptor: RuntimeDescriptor) -> None:
     if descriptor.session_state_schema_version < 1:
         raise RuntimeCompatibilityError(
             "session_state_schema_version must be at least 1"
+        )
+    if not isinstance(descriptor.compaction_ownership, CompactionOwnership):
+        raise RuntimeCompatibilityError(
+            "compaction_ownership must be 'host' or 'runtime_native'"
         )
     if not descriptor.provider_ids and not descriptor.api_modes:
         raise RuntimeCompatibilityError(

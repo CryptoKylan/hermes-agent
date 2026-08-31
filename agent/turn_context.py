@@ -37,7 +37,9 @@ from agent.conversation_compression import (
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
     recover_rotated_compression_session,
+    runtime_compaction_ownership,
 )
+from agent.runtime_api import CompactionOwnership
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
@@ -905,7 +907,13 @@ def build_turn_context(
     # the previous turn finished. The cheap gap pre-check gates the (more
     # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
-    if agent.compression_enabled and _idle_after > 0 and messages:
+    if (
+        agent.compression_enabled
+        and _idle_after > 0
+        and messages
+        and runtime_compaction_ownership(agent)
+        is not CompactionOwnership.RUNTIME_NATIVE
+    ):
         _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
         if _idle_gap >= _idle_after:
             _compressor = agent.context_compressor
@@ -1026,18 +1034,27 @@ def build_turn_context(
         _preflight_deferred = _defer_preflight(_preflight_tokens)
         # Codex app-server threads are compacted by the codex agent itself;
         # Hermes only initiates compaction in "hermes" mode (#36801).
-        _codex_native_auto = (
-            getattr(agent, "api_mode", None) == "codex_app_server"
-            and str(
-                getattr(
-                    agent,
-                    "codex_app_server_auto_compaction",
-                    "native",
-                )
-                or "native"
-            ).lower()
-            in {"native", "off"}
-        )
+        _runtime_compaction = runtime_compaction_ownership(agent)
+        if _runtime_compaction is None:
+            # Compatibility for direct callers/tests that predate the
+            # descriptor marker. Normal conversation turns always set the
+            # marker before entering the prologue.
+            _codex_native_auto = (
+                getattr(agent, "api_mode", None) == "codex_app_server"
+                and str(
+                    getattr(
+                        agent,
+                        "codex_app_server_auto_compaction",
+                        "native",
+                    )
+                    or "native"
+                ).lower()
+                in {"native", "off"}
+            )
+        else:
+            _codex_native_auto = (
+                _runtime_compaction is CompactionOwnership.RUNTIME_NATIVE
+            )
 
         if not _preflight_deferred:
             _last = _compressor.last_prompt_tokens

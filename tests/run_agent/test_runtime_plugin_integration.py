@@ -8,6 +8,9 @@ from agent.runtime_api import (
     RUNTIME_API_VERSION,
     RuntimeCompletedEvent,
     RuntimeDescriptor,
+    RuntimeFailedEvent,
+    RuntimeFailure,
+    RuntimeFailurePhase,
 )
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
@@ -94,3 +97,76 @@ def test_external_plugin_runtime_is_selected_before_the_ordinary_model_loop(
         "close": 1,
         "prompt_snapshot": "composed synthetic prompt",
     }
+
+
+def test_runtime_failure_reaches_host_policy_with_phase_and_replay_classification(
+    monkeypatch,
+):
+    manager = PluginManager()
+    manager._discovered = True
+    context = PluginContext(PluginManifest(name="failing-runtime"), manager)
+
+    class _FailingRuntime:
+        def __init__(self):
+            self.close_calls = 0
+
+        def preflight(self, request):
+            return None
+
+        async def run_turn(self, request, host):
+            yield RuntimeFailedEvent(
+                failure=RuntimeFailure(
+                    code="synthetic_transport_failure",
+                    message="synthetic transport failure",
+                    phase=RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT,
+                    replay_safe=True,
+                    retryable=True,
+                )
+            )
+
+        async def close(self):
+            self.close_calls += 1
+
+    instances = []
+
+    def factory():
+        runtime = _FailingRuntime()
+        instances.append(runtime)
+        return runtime
+
+    context.register_agent_runtime(
+        descriptor=RuntimeDescriptor(
+            runtime_id="failing-test-runtime",
+            plugin_version="0.1.0",
+            runtime_api_min=RUNTIME_API_VERSION,
+            runtime_api_max=RUNTIME_API_VERSION,
+            required_host_capabilities=frozenset({"cancellation_v1"}),
+            provider_ids=frozenset({"openai"}),
+            api_modes=frozenset({"chat_completions"}),
+            session_state_schema_version=1,
+        ),
+        factory=factory,
+    )
+
+    import hermes_cli.plugins as plugins_module
+
+    monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+    agent = run_agent.AIAgent(
+        api_key="synthetic-test-value",
+        base_url="https://test.invalid",
+        provider="openai",
+        model="synthetic-model",
+        api_mode="chat_completions",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._cached_system_prompt = "composed synthetic prompt"
+
+    result = agent.run_conversation("hello")
+
+    assert result["failed"] is True
+    assert result["failure"].phase is RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT
+    assert result["replay_safe"] is True
+    assert result["error"] == "synthetic transport failure"
+    assert instances[0].close_calls == 1

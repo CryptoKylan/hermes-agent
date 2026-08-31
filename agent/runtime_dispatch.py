@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -20,6 +21,7 @@ from agent.runtime_api import (
     RuntimeEvent,
     RuntimeFailedEvent,
     RuntimeFailure,
+    RuntimeFailurePhase,
     RuntimeHostServices,
     RuntimeDescriptor,
     RuntimeRegistration,
@@ -60,6 +62,19 @@ class RuntimeExecutionError(RuntimeError):
 class RuntimeDispatchResult:
     response: Mapping[str, Any]
     events: tuple[RuntimeEvent, ...]
+    terminal: RuntimeCompletedEvent | RuntimeCancelledEvent | RuntimeFailedEvent | None = None
+    failure: RuntimeFailure | None = None
+    cancelled: bool = False
+
+    @property
+    def completed(self) -> bool:
+        """Whether the runtime produced a successful terminal event."""
+        return isinstance(self.terminal, RuntimeCompletedEvent)
+
+    @property
+    def replay_safe(self) -> bool:
+        """Expose the runtime's explicit replay classification to the host."""
+        return bool(self.failure is not None and self.failure.replay_safe)
 
 
 def _freeze_value(value: Any) -> Any:
@@ -125,14 +140,22 @@ async def _collect_runtime_turn(
     runtime: AgentRuntime,
     request: RuntimeTurnRequest,
     host: RuntimeHostServices,
+    descriptor: RuntimeDescriptor | None = None,
 ) -> RuntimeDispatchResult:
+    events: list[RuntimeEvent] = []
+    terminal: RuntimeCompletedEvent | RuntimeCancelledEvent | RuntimeFailedEvent | None = None
     try:
         failure = runtime.preflight(request)
         if failure is not None:
-            raise RuntimeExecutionError(failure.message, failure=failure)
+            terminal = RuntimeFailedEvent(failure=failure)
+            events.append(terminal)
+            return RuntimeDispatchResult(
+                response={},
+                events=tuple(events),
+                terminal=terminal,
+                failure=failure,
+            )
 
-        events: list[RuntimeEvent] = []
-        terminal: RuntimeCompletedEvent | RuntimeCancelledEvent | RuntimeFailedEvent | None = None
         async for event in runtime.run_turn(request, host):
             if not isinstance(event, _RUNTIME_EVENT_TYPES):
                 raise RuntimeExecutionError(
@@ -145,6 +168,21 @@ async def _collect_runtime_turn(
             events.append(event)
             if isinstance(event, RuntimeStatusEvent):
                 await host.emit_status(event.message)
+            elif isinstance(event, RuntimeCompactionEvent):
+                # Compaction is an observable lifecycle event, not a signal to
+                # invoke the host compressor. Runtime-native implementations
+                # own the actual operation; the host only projects the event.
+                if (
+                    descriptor is not None
+                    and descriptor.compaction_ownership
+                    is not CompactionOwnership.RUNTIME_NATIVE
+                ):
+                    raise RuntimeExecutionError(
+                        "runtime emitted compaction event while host owns compaction"
+                    )
+                projector = getattr(host, "emit_compaction", None)
+                if callable(projector):
+                    await projector(event)
             elif isinstance(event, RuntimeStateEvent):
                 await host.persist_state(event.state)
             elif isinstance(event, RuntimeUsageEvent):
@@ -158,29 +196,93 @@ async def _collect_runtime_turn(
         if terminal is None:
             raise RuntimeExecutionError("runtime ended without a terminal event")
         if isinstance(terminal, RuntimeFailedEvent):
-            raise RuntimeExecutionError(
-                terminal.failure.message,
+            return RuntimeDispatchResult(
+                response={},
+                events=tuple(events),
+                terminal=terminal,
                 failure=terminal.failure,
             )
         if isinstance(terminal, RuntimeCancelledEvent):
-            raise RuntimeExecutionError(f"runtime cancelled: {terminal.reason}")
+            return RuntimeDispatchResult(
+                response={},
+                events=tuple(events),
+                terminal=terminal,
+                cancelled=True,
+            )
         return RuntimeDispatchResult(
             response=terminal.result or {},
             events=tuple(events),
+            terminal=terminal,
+        )
+    except asyncio.CancelledError:
+        # A task cancellation is a terminal runtime outcome. It never implies
+        # replay safety: no provider/runtime exception is used to authorize a
+        # host fallback.
+        terminal = RuntimeCancelledEvent(reason="runtime task cancelled")
+        events.append(terminal)
+        return RuntimeDispatchResult(
+            response={},
+            events=tuple(events),
+            terminal=terminal,
+            cancelled=True,
+        )
+    except RuntimeExecutionError:
+        # Contract violations (unknown event, duplicate terminal, or missing
+        # terminal) remain hard errors. They are not classified as replayable
+        # runtime failures and therefore cannot silently enter fallback.
+        raise
+    except Exception:
+        # An unclassified runtime exception is fail-closed. Do not infer
+        # replay safety from its type or message; expose only a bounded,
+        # conservative result for host policy.
+        failure = RuntimeFailure(
+            code="runtime_exception",
+            message="runtime execution failed",
+            phase=(
+                RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT
+                if any(isinstance(item, RuntimeContentEvent) for item in events)
+                else RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT
+            ),
+            replay_safe=False,
+            retryable=False,
+        )
+        terminal = RuntimeFailedEvent(failure=failure)
+        events.append(terminal)
+        return RuntimeDispatchResult(
+            response={},
+            events=tuple(events),
+            terminal=terminal,
+            failure=failure,
         )
     finally:
-        await runtime.close()
+        # The collector is the lifecycle owner: one dispatch means exactly one
+        # close attempt, regardless of preflight, cancellation, failure, or a
+        # malformed event stream. A close error must not erase the classified
+        # turn outcome already returned above.
+        try:
+            await runtime.close()
+        except asyncio.CancelledError:
+            # Cancellation of cleanup itself must not erase the turn's
+            # already-classified terminal outcome.
+            pass
+        except Exception:
+            # Closing is best-effort at this boundary. Runtime implementations
+            # must remain disposable even when their transport has already
+            # failed, and a cleanup exception must not trigger a second close.
+            pass
 
 
 def run_runtime_sync(
     runtime: AgentRuntime,
     request: RuntimeTurnRequest,
     host: RuntimeHostServices,
+    *,
+    descriptor: RuntimeDescriptor | None = None,
 ) -> RuntimeDispatchResult:
     """Run the async contract from Hermes' existing synchronous turn loop."""
     from model_tools import _run_async
 
-    return _run_async(_collect_runtime_turn(runtime, request, host))
+    return _run_async(_collect_runtime_turn(runtime, request, host, descriptor))
 
 
 class BuiltInCodexRuntime:
@@ -236,6 +338,13 @@ class HermesRuntimeHostServices:
         self._task_id = str(task_id)
         self._runtime_id = str(runtime_id)
         self._tool_call_count = 0
+        self._compaction_events: list[dict[str, Any]] = []
+        try:
+            # A fresh host is created for each whole turn, so the lifecycle
+            # projection cannot accidentally bleed into a later turn.
+            self._agent._runtime_compaction_events = self._compaction_events
+        except Exception:
+            pass
         allowed = set(getattr(agent, "valid_tool_names", ()) or ())
         for schema in getattr(agent, "tools", ()) or ():
             if not isinstance(schema, Mapping):
@@ -359,6 +468,34 @@ class HermesRuntimeHostServices:
             model=receipt.model,
             api_call_count=1,
         )
+
+    async def emit_compaction(self, event: RuntimeCompactionEvent) -> None:
+        """Project runtime-native compaction into the host lifecycle stream.
+
+        The event remains runtime-owned: this method never invokes Hermes'
+        compressor.  Only its typed phase and a bounded set of scalar details
+        are retained on the agent for lifecycle observers; arbitrary runtime
+        payloads are intentionally not persisted or surfaced.
+        """
+        if not isinstance(event, RuntimeCompactionEvent):
+            raise RuntimeExecutionError("runtime compaction event has an unsupported type")
+        details = {
+            key: value
+            for key, value in event.details.items()
+            if key in {"watchdog_seconds"}
+            and isinstance(value, (str, int, float, bool))
+        }
+        record = {
+            "runtime_id": self._runtime_id,
+            "phase": event.phase.value,
+            "details": details,
+        }
+        self._compaction_events.append(record)
+
+        # Keep existing host status delivery as the lifecycle projection. The
+        # message is derived solely from the typed phase and carries no runtime
+        # details or provider-specific policy.
+        await self.emit_status(f"Runtime compaction {event.phase.value}")
 
     def cancellation_requested(self) -> bool:
         return bool(getattr(self._agent, "_interrupt_requested", False))

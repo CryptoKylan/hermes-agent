@@ -1965,6 +1965,58 @@ def run_conversation(
     except Exception:
         logger.debug("per-turn env credential refresh failed", exc_info=True)
 
+    # Resolve the whole-turn runtime before the prologue's compression gates.
+    # The descriptor is the sole source of compaction ownership for this turn;
+    # no provider name is consulted by the generic setup path. The built-in
+    # runner closes over values populated by the prologue and is not invoked
+    # until after setup has completed.
+    from agent.runtime_api import (
+        RuntimeFailurePhase,
+        RuntimeSelection,
+        resolve_runtime_registration,
+    )
+    from agent.runtime_dispatch import (
+        HermesRuntimeHostServices,
+        build_runtime_turn_request,
+        make_builtin_codex_registration,
+        run_runtime_sync,
+    )
+    from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+    discover_plugins()
+    plugin_manager = get_plugin_manager()
+    builtin_codex = make_builtin_codex_registration(
+        lambda: agent._run_codex_app_server_turn(
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=_should_review_memory,
+        )
+    )
+    runtime_registration = resolve_runtime_registration(
+        RuntimeSelection(
+            provider=agent.provider,
+            model=agent.model,
+            api_mode=agent.api_mode,
+        ),
+        (
+            builtin_codex,
+            *plugin_manager.iter_agent_runtime_registrations(),
+        ),
+    )
+    # ``None`` is meaningful: it lets direct/manual compression callers keep
+    # their legacy behavior while every normal conversation turn has an
+    # explicit descriptor-derived ownership value.
+    agent._runtime_descriptor = (
+        runtime_registration.descriptor if runtime_registration is not None else None
+    )
+    agent._runtime_compaction_ownership = (
+        runtime_registration.descriptor.compaction_ownership
+        if runtime_registration is not None
+        else None
+    )
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-
@@ -2077,41 +2129,6 @@ def run_conversation(
     # stale prior turn's usage.
     agent._last_turn_usage = None
 
-    # Whole-turn runtimes share one provider-neutral resolver. The built-in
-    # Codex adapter and independently packaged runtimes are descriptor entries
-    # in the same selection set; if nothing matches, Hermes continues through
-    # its ordinary conversation loop unchanged.
-    from agent.runtime_api import RuntimeSelection, resolve_runtime_registration
-    from agent.runtime_dispatch import (
-        HermesRuntimeHostServices,
-        build_runtime_turn_request,
-        make_builtin_codex_registration,
-        run_runtime_sync,
-    )
-    from hermes_cli.plugins import discover_plugins, get_plugin_manager
-
-    discover_plugins()
-    plugin_manager = get_plugin_manager()
-    builtin_codex = make_builtin_codex_registration(
-        lambda: agent._run_codex_app_server_turn(
-            user_message=user_message,
-            original_user_message=original_user_message,
-            messages=messages,
-            effective_task_id=effective_task_id,
-            should_review_memory=_should_review_memory,
-        )
-    )
-    runtime_registration = resolve_runtime_registration(
-        RuntimeSelection(
-            provider=agent.provider,
-            model=agent.model,
-            api_mode=agent.api_mode,
-        ),
-        (
-            builtin_codex,
-            *plugin_manager.iter_agent_runtime_registrations(),
-        ),
-    )
     if runtime_registration is not None:
         runtime_session_state = None
         runtime_database = getattr(agent, "_session_db", None)
@@ -2143,7 +2160,44 @@ def run_conversation(
                 task_id=effective_task_id,
                 runtime_id=runtime_registration.descriptor.runtime_id,
             ),
+            descriptor=runtime_registration.descriptor,
         )
+        if dispatched.failure is not None:
+            _runtime_failure = dispatched.failure
+            return {
+                "final_response": "",
+                "messages": messages,
+                "completed": False,
+                "api_calls": 0,
+                "error": _runtime_failure.message,
+                "partial": _runtime_failure.phase
+                in {
+                    RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT,
+                    RuntimeFailurePhase.AFTER_SIDE_EFFECTS,
+                },
+                "failed": True,
+                "failure": _runtime_failure,
+                "replay_safe": _runtime_failure.replay_safe,
+                "session_id": getattr(agent, "session_id", None),
+            }
+        if dispatched.cancelled:
+            reason = (
+                dispatched.terminal.reason
+                if dispatched.terminal is not None
+                and hasattr(dispatched.terminal, "reason")
+                else "cancelled"
+            )
+            return {
+                "final_response": "",
+                "messages": messages,
+                "completed": False,
+                "api_calls": 0,
+                "error": reason,
+                "partial": True,
+                "failed": False,
+                "interrupted": True,
+                "session_id": getattr(agent, "session_id", None),
+            }
         return dict(dispatched.response)
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
