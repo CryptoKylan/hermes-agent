@@ -3027,11 +3027,22 @@ class TestContinuity:
     """
 
     @staticmethod
+    def _bound_id(session_id, cwd=None):
+        from agent.claude_sdk_runtime import _encode_sdk_resume_binding
+
+        return _encode_sdk_resume_binding(session_id, cwd=cwd)
+
+    @staticmethod
     def _db_agent(persisted_sdk_id=None):
+        from agent.runtime_cwd import resolve_agent_cwd
+
         agent = _make_agent()
         agent._claude_sdk_session = None
         db = MagicMock()
-        db.get_session.return_value = {"claude_sdk_session_id": persisted_sdk_id}
+        db.get_session.return_value = {
+            "claude_sdk_session_id": persisted_sdk_id,
+            "cwd": str(resolve_agent_cwd()),
+        }
         agent._session_db = db
         agent._session_db_created = True
         return agent, db
@@ -3064,7 +3075,9 @@ class TestContinuity:
         return instances
 
     def test_creation_resumes_from_persisted_id(self, monkeypatch):
-        agent, _db = self._db_agent(persisted_sdk_id="sdk-old-1")
+        agent, _db = self._db_agent(
+            persisted_sdk_id=self._bound_id("sdk-old-1")
+        )
         instances = self._spy_sessions(monkeypatch, [_make_turn()])
         run_claude_agent_sdk_turn(
             agent, user_message="hi", original_user_message="hi",
@@ -3074,14 +3087,180 @@ class TestContinuity:
         # A resumed session already holds the context — no digest.
         assert instances[0].inputs == ["hi"]
 
+    def test_bound_resume_same_cwd_uses_embedded_sdk_id(self, monkeypatch):
+        import agent.runtime_cwd as runtime_cwd
+
+        monkeypatch.setattr(runtime_cwd, "resolve_agent_cwd", lambda: "/workspace/a")
+        binding = (
+            'hermes-sdk-resume-v1:{"cwd":"/workspace/a","id":"sdk-bound-1"}'
+        )
+        agent, _db = self._db_agent(persisted_sdk_id=binding)
+        instances = self._spy_sessions(monkeypatch, [_make_turn()])
+
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="t",
+        )
+
+        assert instances[0].kwargs.get("resume_session_id") == "sdk-bound-1"
+        assert instances[0].kwargs.get("cwd") == "/workspace/a"
+
+    def test_bound_resume_changed_cwd_starts_fresh_without_destroying_old_binding(
+        self, monkeypatch
+    ):
+        import agent.runtime_cwd as runtime_cwd
+
+        monkeypatch.setattr(runtime_cwd, "resolve_agent_cwd", lambda: "/workspace/b")
+        binding = (
+            'hermes-sdk-resume-v1:{"cwd":"/workspace/a","id":"sdk-bound-1"}'
+        )
+        agent, db = self._db_agent(persisted_sdk_id=binding)
+        instances = self._spy_sessions(monkeypatch, [_make_turn()])
+        messages = [
+            {"role": "user", "content": "prior question"},
+            {"role": "assistant", "content": "prior answer"},
+            {"role": "user", "content": "continue"},
+        ]
+
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="continue",
+            original_user_message="continue",
+            messages=messages,
+            effective_task_id="t",
+        )
+
+        assert instances[0].kwargs.get("resume_session_id") is None
+        assert instances[0].kwargs.get("cwd") == "/workspace/b"
+        assert instances[0].inputs[0].startswith("[Continuity digest")
+        writes = [call.args for call in db.update_claude_sdk_session_id.call_args_list]
+        assert ("sess-1", None) not in writes
+        assert writes[-1] == (
+            "sess-1",
+            'hermes-sdk-resume-v1:{"cwd":"/workspace/b","id":"sdk-session-1"}',
+        )
+
+    def test_legacy_resume_matching_mutable_row_cwd_starts_fresh(self, monkeypatch):
+        import agent.runtime_cwd as runtime_cwd
+
+        monkeypatch.setattr(runtime_cwd, "resolve_agent_cwd", lambda: "/workspace/a")
+        agent, db = self._db_agent(persisted_sdk_id="sdk-legacy-1")
+        db.get_session.return_value["cwd"] = "/workspace/a"
+        instances = self._spy_sessions(monkeypatch, [_make_turn()])
+
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="t",
+        )
+
+        assert instances[0].kwargs.get("resume_session_id") is None
+        db.update_claude_sdk_session_id.assert_any_call("sess-1", None)
+
+    def test_live_session_is_retired_when_workspace_changes(self, monkeypatch):
+        import agent.runtime_cwd as runtime_cwd
+
+        monkeypatch.setattr(runtime_cwd, "resolve_agent_cwd", lambda: "/workspace/b")
+        agent, db = self._db_agent()
+        live = MagicMock()
+        live._cwd = "/workspace/a"
+        live.run_turn.return_value = _make_turn(thread_id="sdk-old-workspace")
+        agent._claude_sdk_session = live
+        instances = self._spy_sessions(
+            monkeypatch, [_make_turn(thread_id="sdk-new-workspace")]
+        )
+        messages = [
+            {"role": "user", "content": "prior question"},
+            {"role": "assistant", "content": "prior answer"},
+            {"role": "user", "content": "continue in b"},
+        ]
+
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="continue in b",
+            original_user_message="continue in b",
+            messages=messages,
+            effective_task_id="t",
+        )
+
+        live.close.assert_called_once()
+        live.run_turn.assert_not_called()
+        assert len(instances) == 1
+        assert instances[0].kwargs.get("cwd") == "/workspace/b"
+        assert instances[0].kwargs.get("resume_session_id") is None
+        assert instances[0].inputs[0].startswith("[Continuity digest")
+        db.update_claude_sdk_session_id.assert_called_with(
+            "sess-1",
+            'hermes-sdk-resume-v1:{"cwd":"/workspace/b","id":"sdk-new-workspace"}',
+        )
+
+    @pytest.mark.parametrize(
+        "stored_value,row_cwd",
+        [
+            ("hermes-sdk-resume-v1:{not-json", "/workspace/a"),
+            ("sdk-legacy-1", "/workspace/other"),
+        ],
+    )
+    def test_invalid_or_mismatched_legacy_resume_clears_and_starts_fresh(
+        self, monkeypatch, stored_value, row_cwd
+    ):
+        import agent.runtime_cwd as runtime_cwd
+
+        monkeypatch.setattr(runtime_cwd, "resolve_agent_cwd", lambda: "/workspace/a")
+        agent, db = self._db_agent(persisted_sdk_id=stored_value)
+        db.get_session.return_value["cwd"] = row_cwd
+        instances = self._spy_sessions(monkeypatch, [_make_turn()])
+
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="t",
+        )
+
+        assert instances[0].kwargs.get("resume_session_id") is None
+        assert ("sess-1", None) in [
+            call.args for call in db.update_claude_sdk_session_id.call_args_list
+        ]
+
+    def test_successful_turn_persists_cwd_bound_resume_envelope(self, monkeypatch):
+        import agent.runtime_cwd as runtime_cwd
+
+        monkeypatch.setattr(runtime_cwd, "resolve_agent_cwd", lambda: "/workspace/a")
+        agent, db = self._db_agent()
+        self._spy_sessions(monkeypatch, [_make_turn(thread_id="sdk-new-9")])
+
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="t",
+        )
+
+        db.update_claude_sdk_session_id.assert_called_with(
+            "sess-1",
+            'hermes-sdk-resume-v1:{"cwd":"/workspace/a","id":"sdk-new-9"}',
+        )
+
     def test_successful_turn_persists_thread_id(self, monkeypatch):
+        from agent.claude_sdk_runtime import _encode_sdk_resume_binding
+
         agent, db = self._db_agent()
         self._spy_sessions(monkeypatch, [_make_turn(thread_id="sdk-new-9")])
         run_claude_agent_sdk_turn(
             agent, user_message="hi", original_user_message="hi",
             messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
         )
-        db.update_claude_sdk_session_id.assert_called_with("sess-1", "sdk-new-9")
+        db.update_claude_sdk_session_id.assert_called_with(
+            "sess-1", _encode_sdk_resume_binding("sdk-new-9")
+        )
 
     def test_error_retire_clears_persisted_id(self, monkeypatch):
         agent, db = self._db_agent()
@@ -3098,7 +3277,9 @@ class TestContinuity:
     def test_eligible_handoff_keeps_failed_session_id_durably_cleared(
         self, monkeypatch
     ):
-        agent, db = self._db_agent(persisted_sdk_id="sdk-failed-8")
+        agent, db = self._db_agent(
+            persisted_sdk_id=self._bound_id("sdk-failed-8")
+        )
         self._spy_sessions(monkeypatch, [_make_turn(
             thread_id="sdk-failed-8",
             should_retire=False,
@@ -3172,7 +3353,9 @@ class TestContinuity:
         # The Pi probe: a stale resume id fails the session. The runtime
         # must clear the id and retry ONCE fresh (digest included) — the
         # user gets an answer, not an error.
-        agent, db = self._db_agent(persisted_sdk_id="sdk-stale-7")
+        agent, db = self._db_agent(
+            persisted_sdk_id=self._bound_id("sdk-stale-7")
+        )
         instances = self._spy_sessions(monkeypatch, [
             _make_turn(should_retire=True, error="resume failed",
                        projected_messages=[], final_text="", token_usage_last=None),
@@ -3246,6 +3429,8 @@ class TestContinuity:
         # client's stream — a REUSED client would serve it as the NEXT turn's
         # answer. The runtime must retire the client (clean stream) while
         # persisting the SDK id, so the next turn RESUMES the conversation.
+        from agent.claude_sdk_runtime import _encode_sdk_resume_binding
+
         agent, db = self._db_agent()
         self._spy_sessions(monkeypatch, [_make_turn(
             interrupted=True, final_text="partial answer", thread_id="sdk-live-3",
@@ -3255,7 +3440,9 @@ class TestContinuity:
             messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
         )
         assert agent._claude_sdk_session is None  # client retired
-        db.update_claude_sdk_session_id.assert_called_with("sess-1", "sdk-live-3")
+        db.update_claude_sdk_session_id.assert_called_with(
+            "sess-1", _encode_sdk_resume_binding("sdk-live-3")
+        )
         assert result["partial"] is True
 
     def test_fresh_retire_does_not_retry(self, monkeypatch):
@@ -3278,7 +3465,9 @@ class TestContinuity:
         # that killed the CLI, a hard watchdog trip) must NOT re-run the
         # turn — the retry would evaporate the stop and deliver the answer
         # anyway. Only non-interrupted resume failures earn the retry.
-        agent, _db = self._db_agent(persisted_sdk_id="sdk-live-1")
+        agent, _db = self._db_agent(
+            persisted_sdk_id=self._bound_id("sdk-live-1")
+        )
         instances = self._spy_sessions(monkeypatch, [_make_turn(
             should_retire=True, interrupted=True,
             error="SDK message stream ended before this turn's result",
@@ -3292,7 +3481,9 @@ class TestContinuity:
         assert result["partial"] is True
 
     def test_late_stop_after_terminal_retire_does_not_retry(self, monkeypatch):
-        agent, _db = self._db_agent(persisted_sdk_id="sdk-live-1")
+        agent, _db = self._db_agent(
+            persisted_sdk_id=self._bound_id("sdk-live-1")
+        )
         import agent.transports.claude_agent_sdk_session as sdk_session_mod
 
         instances = []
@@ -3340,7 +3531,9 @@ class TestContinuity:
         assert result.get("failover_reason") is None
 
     def test_raising_resumed_turn_with_stop_does_not_retry(self, monkeypatch):
-        agent, _db = self._db_agent(persisted_sdk_id="sdk-live-1")
+        agent, _db = self._db_agent(
+            persisted_sdk_id=self._bound_id("sdk-live-1")
+        )
         import agent.transports.claude_agent_sdk_session as sdk_session_mod
 
         instances = []

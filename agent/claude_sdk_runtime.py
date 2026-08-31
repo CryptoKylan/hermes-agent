@@ -15,6 +15,7 @@ issue #25267.
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import math
 import os
@@ -882,6 +883,28 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
     }
 
 
+_SDK_RESUME_BINDING_PREFIX = "hermes-sdk-resume-v1:"
+
+
+def _canonical_sdk_cwd(value: Optional[str] = None) -> str:
+    """Return the canonical CWD identity used to bind SDK resume IDs."""
+    if value is None:
+        from agent.runtime_cwd import resolve_agent_cwd
+
+        value = str(resolve_agent_cwd())
+    return os.path.normcase(os.path.realpath(os.path.abspath(os.path.expanduser(str(value)))))
+
+
+def _encode_sdk_resume_binding(session_id: str, *, cwd: Optional[str] = None) -> str:
+    payload = {
+        "cwd": _canonical_sdk_cwd(cwd),
+        "id": str(session_id),
+    }
+    return _SDK_RESUME_BINDING_PREFIX + json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    )
+
+
 def _persisted_sdk_session_id(agent) -> Optional[str]:
     """The SDK session id stored on the Hermes session row (or None)."""
     if getattr(agent, "_persist_disabled", False):
@@ -890,13 +913,42 @@ def _persisted_sdk_session_id(agent) -> Optional[str]:
         return None
     try:
         row = agent._session_db.get_session(agent.session_id) or {}
-        return row.get("claude_sdk_session_id") or None
+        raw = row.get("claude_sdk_session_id") or None
+        if not isinstance(raw, str) or not raw:
+            return None
+        current_cwd = _canonical_sdk_cwd()
+        if raw.startswith(_SDK_RESUME_BINDING_PREFIX):
+            try:
+                payload = json.loads(raw[len(_SDK_RESUME_BINDING_PREFIX) :])
+                session_id = payload["id"]
+                bound_cwd = payload["cwd"]
+                if not isinstance(session_id, str) or not session_id:
+                    raise ValueError("empty SDK session id")
+                if not isinstance(bound_cwd, str) or not bound_cwd:
+                    raise ValueError("empty SDK resume cwd")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                _store_sdk_session_id(agent, None)
+                return None
+        else:
+            # Legacy raw IDs and unknown envelope versions have no trustworthy
+            # creation-workspace provenance.  The session row's CWD is mutable,
+            # so it cannot retroactively authorize a cross-workspace resume.
+            _store_sdk_session_id(agent, None)
+            return None
+        if _canonical_sdk_cwd(bound_cwd) != current_cwd:
+            logger.info(
+                "claude-agent-sdk: declining resume id bound to a different cwd"
+            )
+            return None
+        return session_id
     except Exception:
         logger.debug("resume-id read failed", exc_info=True)
         return None
 
 
-def _store_sdk_session_id(agent, value: Optional[str]) -> None:
+def _store_sdk_session_id(
+    agent, value: Optional[str], *, cwd: Optional[str] = None
+) -> None:
     """Persist (or clear, with None) the SDK session id on the session row."""
     if getattr(agent, "_persist_disabled", False):
         # A review/curator fork shares the parent's session_id — it must
@@ -905,7 +957,10 @@ def _store_sdk_session_id(agent, value: Optional[str]) -> None:
     if not (getattr(agent, "_session_db", None) and getattr(agent, "session_id", None)):
         return
     try:
-        agent._session_db.update_claude_sdk_session_id(agent.session_id, value)
+        stored = (
+            _encode_sdk_resume_binding(value, cwd=cwd) if value is not None else None
+        )
+        agent._session_db.update_claude_sdk_session_id(agent.session_id, stored)
     except Exception:
         logger.debug("resume-id write failed", exc_info=True)
 
@@ -1453,6 +1508,18 @@ def run_claude_agent_sdk_turn(
 
     on_interim_assistant, on_tool_iteration = _make_visibility_callbacks()
     live_session = getattr(agent, "_claude_sdk_session", None)
+    live_cwd = getattr(live_session, "_cwd", None) if live_session is not None else None
+    if isinstance(live_cwd, str):
+        if _canonical_sdk_cwd(live_cwd) != _canonical_sdk_cwd():
+            logger.info(
+                "claude-agent-sdk: retiring live session after workspace change"
+            )
+            try:
+                live_session.close()
+            except Exception:
+                logger.debug("workspace-change session close failed", exc_info=True)
+            agent._claude_sdk_session = None
+            live_session = None
     if live_session is not None:
         try:
             live_session.set_turn_visibility_callbacks(
@@ -1482,6 +1549,9 @@ def run_claude_agent_sdk_turn(
                         send_input = digest + user_input
             _create_session(resume_id)
 
+        turn_session_cwd = getattr(agent._claude_sdk_session, "_cwd", None)
+        if not isinstance(turn_session_cwd, str):
+            turn_session_cwd = None
         try:
             turn = agent._claude_sdk_session.run_turn(user_input=send_input)
         except Exception as exc:
@@ -1693,7 +1763,7 @@ def run_claude_agent_sdk_turn(
         # transient lock — storing first would silently discard the id.
         thread_id = getattr(turn, "thread_id", None)
         if thread_id:
-            _store_sdk_session_id(agent, thread_id)
+            _store_sdk_session_id(agent, thread_id, cwd=turn_session_cwd)
 
     # Counter ticks — _turns_since_memory/_user_turn_count are incremented by
     # run_conversation()'s pre-loop block; only _iters_since_skill is ours.
