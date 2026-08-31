@@ -49,6 +49,19 @@ _RUNTIME_EVENT_TYPES = (
     RuntimeFailedEvent,
 )
 
+_RUNTIME_SIDE_EFFECT_EVENT_TYPES = (
+    RuntimeCompactionEvent,
+    RuntimeStateEvent,
+    RuntimeUsageEvent,
+)
+
+_RUNTIME_VISIBLE_EVENT_TYPES = (
+    RuntimeContentEvent,
+    RuntimeStatusEvent,
+    RuntimeToolRequestEvent,
+    RuntimeApprovalRequestEvent,
+)
+
 
 class RuntimeExecutionError(RuntimeError):
     """A runtime failed its preflight or terminal event contract."""
@@ -75,6 +88,16 @@ class RuntimeDispatchResult:
     def replay_safe(self) -> bool:
         """Expose the runtime's explicit replay classification to the host."""
         return bool(self.failure is not None and self.failure.replay_safe)
+
+
+def _unclassified_failure_phase(events: Sequence[RuntimeEvent]) -> RuntimeFailurePhase:
+    """Return the most conservative phase proved by already-emitted events."""
+
+    if any(isinstance(event, _RUNTIME_SIDE_EFFECT_EVENT_TYPES) for event in events):
+        return RuntimeFailurePhase.AFTER_SIDE_EFFECTS
+    if any(isinstance(event, _RUNTIME_VISIBLE_EVENT_TYPES) for event in events):
+        return RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT
+    return RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT
 
 
 def _freeze_value(value: Any) -> Any:
@@ -238,11 +261,7 @@ async def _collect_runtime_turn(
         failure = RuntimeFailure(
             code="runtime_exception",
             message="runtime execution failed",
-            phase=(
-                RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT
-                if any(isinstance(item, RuntimeContentEvent) for item in events)
-                else RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT
-            ),
+            phase=_unclassified_failure_phase(events),
             replay_safe=False,
             retryable=False,
         )

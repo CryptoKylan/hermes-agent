@@ -369,6 +369,60 @@ def test_unclassified_runtime_exception_is_fail_closed_and_closes_once():
     assert runtime.close_calls == 1
 
 
+class _ExplodingAfterStateRuntime:
+    def preflight(self, request):
+        return None
+
+    async def run_turn(self, request, host) -> AsyncIterator[object]:
+        yield RuntimeStateEvent(
+            state=RuntimeStateEnvelope(
+                runtime_id="example-runtime",
+                schema_version=1,
+                state={"external_session": "synthetic"},
+            )
+        )
+        raise RuntimeError("synthetic failure after persistence")
+
+    async def close(self):
+        return None
+
+
+def test_unclassified_exception_after_persistence_is_classified_after_side_effects():
+    result = run_runtime_sync(
+        _ExplodingAfterStateRuntime(),
+        _request(),
+        _HostServices(),
+    )
+
+    assert result.failure is not None
+    assert result.failure.phase is RuntimeFailurePhase.AFTER_SIDE_EFFECTS
+    assert result.failure.replay_safe is False
+
+
+class _ExplodingAfterStatusRuntime:
+    def preflight(self, request):
+        return None
+
+    async def run_turn(self, request, host) -> AsyncIterator[object]:
+        yield RuntimeStatusEvent(message="working")
+        raise RuntimeError("synthetic failure after visible status")
+
+    async def close(self):
+        return None
+
+
+def test_unclassified_exception_after_visible_status_is_not_preflight_safe():
+    result = run_runtime_sync(
+        _ExplodingAfterStatusRuntime(),
+        _request(),
+        _HostServices(),
+    )
+
+    assert result.failure is not None
+    assert result.failure.phase is RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT
+    assert result.failure.replay_safe is False
+
+
 class _CompactingRuntime:
     def __init__(self):
         self.close_calls = 0
