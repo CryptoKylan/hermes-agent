@@ -192,6 +192,8 @@ class RuntimeUsageReceipt:
     reasoning_tokens: int = 0
     replay_safe: bool = False
     correlation_id: str | None = None
+    fallback_used: bool = False
+    failure_phase: RuntimeFailurePhase | None = None
 
 
 @dataclass(frozen=True)

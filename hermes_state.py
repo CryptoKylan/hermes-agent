@@ -47,7 +47,11 @@ from agent.message_sanitization import _sanitize_surrogates
 from agent.context_compressor import (
     _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY,
 )
-from agent.runtime_api import RuntimeStateEnvelope, RuntimeUsageReceipt
+from agent.runtime_api import (
+    RuntimeFailurePhase,
+    RuntimeStateEnvelope,
+    RuntimeUsageReceipt,
+)
 from agent.skill_commands import (
     SKILL_EXCERPT_JOINT,
     SKILL_SCAFFOLD_SQL_LIKE,
@@ -303,6 +307,12 @@ def _validate_runtime_usage_receipt(receipt: RuntimeUsageReceipt) -> None:
             raise ValueError(f"{field} must be a bounded non-negative integer")
     if not isinstance(receipt.replay_safe, bool):
         raise ValueError("replay_safe must be a boolean")
+    if not isinstance(receipt.fallback_used, bool):
+        raise ValueError("fallback_used must be a boolean")
+    if receipt.failure_phase is not None and not isinstance(
+        receipt.failure_phase, RuntimeFailurePhase
+    ):
+        raise ValueError("failure_phase must be a RuntimeFailurePhase or None")
     if receipt.correlation_id is not None:
         correlation_id = _validate_runtime_text(
             receipt.correlation_id, "correlation_id"
@@ -14826,8 +14836,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        session_id, runtime_id, provider, model, billing_mode,
                        cost_status, input_tokens, output_tokens,
                        cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                       replay_safe, correlation_id, recorded_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       replay_safe, correlation_id, fallback_used, failure_phase,
+                       recorded_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     receipt.runtime_id,
@@ -14842,6 +14853,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     receipt.reasoning_tokens,
                     1 if receipt.replay_safe else 0,
                     receipt.correlation_id,
+                    1 if receipt.fallback_used else 0,
+                    receipt.failure_phase.value
+                    if receipt.failure_phase is not None
+                    else None,
                     time.time(),
                 ),
             )
@@ -14866,7 +14881,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """SELECT runtime_id, provider, model, billing_mode,
                               cost_status, input_tokens, output_tokens,
                               cache_read_tokens, cache_write_tokens,
-                              reasoning_tokens, replay_safe, correlation_id
+                              reasoning_tokens, replay_safe, correlation_id,
+                              fallback_used, failure_phase
                          FROM runtime_usage_receipts
                         WHERE session_id = ?"""
                 + runtime_clause
@@ -14888,6 +14904,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 reasoning_tokens=row["reasoning_tokens"],
                 replay_safe=bool(row["replay_safe"]),
                 correlation_id=row["correlation_id"],
+                fallback_used=bool(row["fallback_used"]),
+                failure_phase=(
+                    RuntimeFailurePhase(row["failure_phase"])
+                    if row["failure_phase"] is not None
+                    else None
+                ),
             )
             _validate_runtime_usage_receipt(receipt)
             receipts.append(receipt)

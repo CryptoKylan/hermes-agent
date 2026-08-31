@@ -206,12 +206,19 @@ def test_host_persists_runtime_state_and_idempotent_usage_for_selected_runtime()
         billing_mode="subscription_included",
         cost_status="included",
         correlation_id="synthetic-turn",
+        fallback_used=True,
+        failure_phase=RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT,
     )
 
     _run_async(host.persist_state(state))
     _run_async(host.persist_usage(receipt))
     assert agent._session_db.states == [("synthetic-session", state)]
     assert agent._session_db.receipts == [("synthetic-session", receipt)]
+    assert agent._session_db.receipts[0][1].fallback_used is True
+    assert (
+        agent._session_db.receipts[0][1].failure_phase
+        is RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT
+    )
     assert len(agent._session_db.aggregate_receipts) == 1
 
     agent._session_db.inserted = False

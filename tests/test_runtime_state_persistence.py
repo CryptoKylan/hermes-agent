@@ -6,11 +6,20 @@ import math
 
 import pytest
 
-from agent.runtime_api import RuntimeStateEnvelope, RuntimeUsageReceipt
+from agent.runtime_api import (
+    RuntimeFailurePhase,
+    RuntimeStateEnvelope,
+    RuntimeUsageReceipt,
+)
 from hermes_state import SessionDB
 
 
-def _receipt(*, correlation_id: str | None = "turn-1") -> RuntimeUsageReceipt:
+def _receipt(
+    *,
+    correlation_id: str | None = "turn-1",
+    fallback_used: bool = False,
+    failure_phase: RuntimeFailurePhase | None = None,
+) -> RuntimeUsageReceipt:
     return RuntimeUsageReceipt(
         runtime_id="example-runtime",
         provider="example-provider",
@@ -24,6 +33,8 @@ def _receipt(*, correlation_id: str | None = "turn-1") -> RuntimeUsageReceipt:
         reasoning_tokens=3,
         replay_safe=True,
         correlation_id=correlation_id,
+        fallback_used=fallback_used,
+        failure_phase=failure_phase,
     )
 
 
@@ -72,6 +83,8 @@ def test_fresh_schema_contains_runtime_tables(tmp_path):
             "reasoning_tokens",
             "replay_safe",
             "correlation_id",
+            "fallback_used",
+            "failure_phase",
             "recorded_at",
         } <= receipt_columns
     finally:
@@ -160,7 +173,12 @@ def test_runtime_usage_receipts_are_append_only_and_correlated_retries_are_idemp
         )
 
         changed_retry = RuntimeUsageReceipt(
-            **{**original.__dict__, "output_tokens": 999}
+            **{
+                **original.__dict__,
+                "output_tokens": 999,
+                "fallback_used": True,
+                "failure_phase": RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT,
+            }
         )
         assert db.record_runtime_usage_receipt("session-a", changed_retry) is False
         assert db.list_runtime_usage_receipts("session-a") == [original]
@@ -174,6 +192,76 @@ def test_runtime_usage_receipts_are_append_only_and_correlated_retries_are_idemp
         db.close()
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("fallback_used", 1), ("failure_phase", "unsupported-phase")],
+)
+def test_runtime_usage_receipts_reject_untyped_classifications(
+    tmp_path, field, value
+):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("session-a", source="cli")
+        receipt = _receipt(**{field: value})
+        with pytest.raises(ValueError, match=field):
+            db.record_runtime_usage_receipt("session-a", receipt)
+    finally:
+        db.close()
+
+
+def test_legacy_runtime_usage_receipts_reconcile_classification_columns(tmp_path):
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.create_session("session-a", source="cli")
+    db._conn.execute(
+        "ALTER TABLE runtime_usage_receipts DROP COLUMN fallback_used"
+    )
+    db._conn.execute(
+        "ALTER TABLE runtime_usage_receipts DROP COLUMN failure_phase"
+    )
+    db._conn.execute(
+        """INSERT INTO runtime_usage_receipts (
+               session_id, runtime_id, provider, model, billing_mode,
+               cost_status, input_tokens, output_tokens, cache_read_tokens,
+               cache_write_tokens, reasoning_tokens, replay_safe,
+               correlation_id, recorded_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "session-a",
+            "example-runtime",
+            "example-provider",
+            "example-model",
+            "subscription",
+            "known",
+            10,
+            4,
+            2,
+            1,
+            3,
+            1,
+            "legacy-turn",
+            1.0,
+        ),
+    )
+    db._conn.commit()
+    db.close()
+
+    reopened = SessionDB(db_path=db_path)
+    try:
+        columns = {
+            row[1]
+            for row in reopened._conn.execute(
+                "PRAGMA table_info(runtime_usage_receipts)"
+            ).fetchall()
+        }
+        assert {"fallback_used", "failure_phase"} <= columns
+        assert reopened.list_runtime_usage_receipts("session-a") == [
+            _receipt(correlation_id="legacy-turn")
+        ]
+    finally:
+        reopened.close()
+
+
 def test_runtime_state_and_receipts_are_inert_across_reopen(tmp_path):
     db_path = tmp_path / "state.db"
     db = SessionDB(db_path=db_path)
@@ -183,9 +271,16 @@ def test_runtime_state_and_receipts_are_inert_across_reopen(tmp_path):
         schema_version=1,
         state={"retained": True},
     )
-    receipt = _receipt()
+    receipt = _receipt(
+        fallback_used=True,
+        failure_phase=RuntimeFailurePhase.AFTER_SIDE_EFFECTS,
+    )
     db.update_runtime_state("session-a", state)
     db.record_runtime_usage_receipt("session-a", receipt)
+    raw_receipt = db._conn.execute(
+        "SELECT fallback_used, failure_phase FROM runtime_usage_receipts"
+    ).fetchone()
+    assert tuple(raw_receipt) == (1, "after_side_effects")
     db.close()
 
     reopened = SessionDB(db_path=db_path)

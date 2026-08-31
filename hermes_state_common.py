@@ -514,6 +514,8 @@ CREATE TABLE IF NOT EXISTS runtime_usage_receipts (
     reasoning_tokens INTEGER NOT NULL DEFAULT 0,
     replay_safe INTEGER NOT NULL DEFAULT 0,
     correlation_id TEXT,
+    fallback_used INTEGER NOT NULL DEFAULT 0,
+    failure_phase TEXT,
     recorded_at REAL NOT NULL
 );
 
