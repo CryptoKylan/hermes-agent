@@ -1486,6 +1486,7 @@ def run_claude_agent_sdk_turn(
             turn = agent._claude_sdk_session.run_turn(user_input=send_input)
         except Exception as exc:
             safe_exc = redact_sensitive_text(str(exc), force=True)
+            interrupted = bool(getattr(agent, "_interrupt_requested", False))
             # A PreCompact hook may have opened a transient user-visible status.
             # This exception bypasses the normal terminal edge below; clear it
             # here so a later unrelated turn cannot announce stale completion.
@@ -1505,9 +1506,15 @@ def run_claude_agent_sdk_turn(
             except Exception:
                 pass
             agent._claude_sdk_session = None
-            if resumed and attempt == 0:
+            if interrupted:
+                # The session close above consumes transport-local interrupt
+                # state. Consume the agent layer too: this dead turn honored
+                # the user's stop and must not reject the next message.
+                agent._interrupt_requested = False
+            if resumed and attempt == 0 and not interrupted:
                 # A raising RESUMED session is a suspect resume — clear the
                 # id and give the turn one fresh chance (digest included).
+                # Never replay a turn that concurrently received /stop.
                 _store_sdk_session_id(agent, None)
                 resumed = False
                 continue
@@ -1517,11 +1524,12 @@ def run_claude_agent_sdk_turn(
                 "api_calls": 0,
                 "completed": False,
                 "partial": True,
+                "interrupted": interrupted,
                 # run_turn consumes its own exceptions into TurnResult, so
                 # anything RAISING here is a dead turn, not a recoverable
                 # partial — mark it failed so one-shot runs exit nonzero
                 # (mirrors conversation_loop's generic non-retryable return).
-                "failed": True,
+                "failed": not interrupted,
                 "error": safe_exc,
             }
 
@@ -1542,6 +1550,7 @@ def run_claude_agent_sdk_turn(
                 resumed
                 and attempt == 0
                 and not getattr(turn, "interrupted", False)
+                and not getattr(agent, "_interrupt_requested", False)
             ):
                 # Stale/failed resume: one fresh retry with digest. Never for
                 # an INTERRUPTED retire (user /stop that killed the CLI, or a
@@ -1550,6 +1559,40 @@ def run_claude_agent_sdk_turn(
                 resumed = False
                 continue
         break
+
+    if (
+        not bool(getattr(turn, "terminal_result_accepted", False))
+        and not bool(getattr(turn, "interrupted", False))
+        and bool(getattr(agent, "_interrupt_requested", False))
+    ):
+        # No terminal result committed, so the concurrent stop still belongs
+        # to this turn. Mark it before effects/retry/failover handling so the
+        # normal interrupt handoff consumes the agent flag and retires safely.
+        turn.interrupted = True
+
+    if (
+        bool(getattr(turn, "terminal_result_accepted", False))
+        and not bool(getattr(turn, "interrupted", False))
+        and bool(getattr(agent, "_interrupt_requested", False))
+    ):
+        if getattr(turn, "error", None):
+            # A failed terminal result is not a completed answer to preserve.
+            # Keep the stop authoritative so retry/failover cannot replay the
+            # failed prompt after the user asked to abandon it.
+            turn.interrupted = True
+        else:
+            # The transport accepted a successful terminal ResultMessage
+            # before this stop was observed. Consume both layers of the late
+            # signal so neither effects nor the next turn are poisoned.
+            agent._interrupt_requested = False
+            live_session = getattr(agent, "_claude_sdk_session", None)
+            if live_session is not None:
+                try:
+                    live_session.consume_interrupt()
+                except Exception:
+                    logger.debug(
+                        "late terminal interrupt consume failed", exc_info=True
+                    )
 
     _sdk_effects = ClaudeSdkTurnEffects(
         tool=(
