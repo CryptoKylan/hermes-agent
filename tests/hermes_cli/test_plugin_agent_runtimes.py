@@ -9,7 +9,15 @@ from agent.runtime_api import (
     RUNTIME_API_VERSION,
     RuntimeCompatibilityError,
     RuntimeDescriptor,
+    RuntimeRegistration,
+    RuntimeRegistrationError,
     RuntimeSelection,
+    resolve_runtime_registration,
+    runtime_api_manifest,
+)
+from agent.runtime_dispatch import (
+    build_runtime_turn_request,
+    make_builtin_codex_registration,
 )
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
@@ -27,7 +35,7 @@ def _descriptor(**overrides) -> RuntimeDescriptor:
         "plugin_version": "0.1.0",
         "runtime_api_min": RUNTIME_API_VERSION,
         "runtime_api_max": RUNTIME_API_VERSION,
-        "required_host_capabilities": frozenset({"host_tool_execution"}),
+        "required_host_capabilities": frozenset({"host_tool_execution_v1"}),
         "provider_ids": frozenset({"example"}),
         "api_modes": frozenset({"example_runtime"}),
         "session_state_schema_version": 1,
@@ -115,3 +123,138 @@ def test_runtime_registration_is_removed_when_plugin_unloads():
     assert manager.unload("runtime-plugin") is True
     assert manager.get_agent_runtime("example-runtime") is None
 
+
+def test_host_manifest_exports_only_versioned_concrete_capabilities():
+    manifest = runtime_api_manifest()
+
+    assert manifest["runtime_api_version"] == RUNTIME_API_VERSION
+    assert manifest["host_capabilities"] == sorted(HOST_RUNTIME_CAPABILITIES)
+    assert "host_tool_execution_v1" in manifest["host_capabilities"]
+    assert all(capability.endswith("_v1") for capability in manifest["host_capabilities"])
+
+
+def test_runtime_turn_request_is_deeply_immutable():
+    source_messages = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}],
+        }
+    ]
+    source_tools = [
+        {
+            "name": "pwd",
+            "parameters": {"type": "object", "required": []},
+        }
+    ]
+
+    request = build_runtime_turn_request(
+        provider="example",
+        model="example-large",
+        api_mode="example_runtime",
+        messages=source_messages,
+        prompt_snapshot="stable prompt",
+        tool_schemas=source_tools,
+    )
+
+    source_messages[0]["content"][0]["text"] = "mutated outside"
+    source_tools[0]["parameters"]["required"].append("path")
+
+    assert request.messages[0]["content"][0]["text"] == "hello"
+    assert request.tool_schemas[0]["parameters"]["required"] == ()
+    same_schema = build_runtime_turn_request(
+        provider="example",
+        model="example-large",
+        api_mode="example_runtime",
+        messages=(),
+        prompt_snapshot="stable prompt",
+        tool_schemas=(
+            {
+                "parameters": {"required": [], "type": "object"},
+                "name": "pwd",
+            },
+        ),
+    )
+    assert request.tool_schema_hash == same_schema.tool_schema_hash
+    assert len(request.tool_schema_hash) == 64
+    with pytest.raises(TypeError):
+        request.messages[0]["content"][0]["text"] = "mutated inside"
+    with pytest.raises(AttributeError):
+        request.tool_schemas[0]["parameters"]["required"].append("path")
+
+
+def test_builtin_and_plugin_registrations_use_one_resolver():
+    builtin = RuntimeRegistration(
+        descriptor=_descriptor(
+            runtime_id="hermes-codex",
+            provider_ids=frozenset(),
+            api_modes=frozenset({"codex_app_server"}),
+        ),
+        factory=object,
+        plugin_id="hermes-core",
+    )
+    plugin = RuntimeRegistration(
+        descriptor=_descriptor(),
+        factory=object,
+        plugin_id="runtime-plugin",
+    )
+
+    assert resolve_runtime_registration(
+        RuntimeSelection(
+            provider="codex",
+            model="gpt-5.6-sol",
+            api_mode="codex_app_server",
+        ),
+        (builtin, plugin),
+    ) is builtin
+    assert resolve_runtime_registration(
+        RuntimeSelection(
+            provider="example",
+            model="example-large",
+            api_mode="example_runtime",
+        ),
+        (builtin, plugin),
+    ) is plugin
+
+
+def test_shared_resolver_rejects_ambiguous_runtime_selection():
+    first = RuntimeRegistration(
+        descriptor=_descriptor(runtime_id="first-runtime"),
+        factory=object,
+        plugin_id="first-plugin",
+    )
+    second = RuntimeRegistration(
+        descriptor=_descriptor(runtime_id="second-runtime"),
+        factory=object,
+        plugin_id="second-plugin",
+    )
+
+    with pytest.raises(RuntimeRegistrationError, match="multiple runtimes"):
+        resolve_runtime_registration(
+            RuntimeSelection(
+                provider="example",
+                model="example-large",
+                api_mode="example_runtime",
+            ),
+            (first, second),
+        )
+
+
+def test_builtin_codex_registration_is_resolved_with_plugin_registrations():
+    context, manager = _make_context()
+    context.register_agent_runtime(descriptor=_descriptor(), factory=object)
+    builtin = make_builtin_codex_registration(lambda: {"final_response": "done"})
+
+    registration = resolve_runtime_registration(
+        RuntimeSelection(
+            provider="codex",
+            model="gpt-5.6-sol",
+            api_mode="codex_app_server",
+        ),
+        (builtin, *manager.iter_agent_runtime_registrations()),
+    )
+
+    assert registration is builtin
+    assert registration.plugin_id == "hermes-core"
+    assert registration.descriptor.required_host_capabilities == frozenset(
+        {"cancellation_v1"}
+    )

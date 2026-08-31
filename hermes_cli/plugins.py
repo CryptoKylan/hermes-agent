@@ -4262,24 +4262,18 @@ class PluginManager:
         """Return registration metadata without creating the runtime."""
         return self._agent_runtimes.get(runtime_id)
 
+    def iter_agent_runtime_registrations(self) -> tuple[Any, ...]:
+        """Return a stable snapshot for the host's shared runtime resolver."""
+        return tuple(self._agent_runtimes.values())
+
     def select_agent_runtime(self, selection: Any) -> Any:
         """Select one compatible runtime using descriptor-only routing."""
-        matches = [
-            registration
-            for registration in self._agent_runtimes.values()
-            if registration.descriptor.supports(selection)
-        ]
-        if not matches:
-            return None
-        if len(matches) > 1:
-            from agent.runtime_api import RuntimeRegistrationError
+        from agent.runtime_api import resolve_runtime_registration
 
-            runtime_ids = sorted(item.descriptor.runtime_id for item in matches)
-            raise RuntimeRegistrationError(
-                "multiple runtimes support the same selection: "
-                + ", ".join(runtime_ids)
-            )
-        return matches[0]
+        return resolve_runtime_registration(
+            selection,
+            tuple(self._agent_runtimes.values()),
+        )
 
     def set_gateway_message_injector(
         self,

@@ -1,12 +1,12 @@
 # AgentRuntime v1 coupling map
 
-Source identities: Hermes `main@1cf36398135f4848a1d04b2167ffb564b7881d35`;
+Source identities: Hermes `main@64b96bb5d2755f1d34347e1fb15924a97d652f31`;
 downstream candidate `6967371b9ff8efce9372dd428b3b764322bd6481`;
 PR #65982 `41def1e24e5223efa246d9fc57575db7181c6021`.
 
 | Current path / symbol | Behavior | Claude-specific assumption | Built-in Codex analogue | Proposed generic contract | Final owner | Migration method | Baseline tests | Remaining risk |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `hermes_cli/providers.py`, `runtime_provider.py` | Provider/model resolution selects a whole-turn mode | Claude is a model-provider transport with named aliases | `api_mode=codex_app_server` | Descriptor selectors plus pure `supports()` | Host registry; plugin descriptor | Add runtime selection after existing provider resolution; remove Claude aliases from core | Runtime resolution and compatibility contract | Selector precedence can accidentally route to metered Anthropic |
+| `hermes_cli/providers.py`, `runtime_provider.py` | Provider/model resolution selects a whole-turn mode | Claude is a model-provider transport with named aliases | `api_mode=codex_app_server` | Descriptor selectors plus pure `preflight()` | Host registry; plugin descriptor | Add runtime selection after existing provider resolution; remove Claude aliases from core | Runtime resolution and compatibility contract | Selector precedence can accidentally route to metered Anthropic |
 | `hermes_cli/plugins.py::PluginContext` | Existing pip/directory plugin discovery and tracked unload | No runtime factory registration exists | General tools/hooks use tracked replacement slots | `register_agent_runtime(descriptor, factory)` | Host | Add one context method and profile-scoped registry; reuse entry point loader | Real entry-point discovery, unload, duplicate registration | Import-time plugin side effects must remain inert before handshake |
 | `agent/conversation_loop.py::run_conversation` | Whole-turn branch bypasses generic loop | Provider-named Claude branches and replay logic live in the loop | One Codex short-circuit already exists | Generic runtime lookup and dispatch at the same point | Host | Adapt Codex first; replace Claude branches with runtime result handling | Built-in Codex behavior plus external fake runtime | Fallback into/out of generic loop must preserve the one user row |
 | `agent/codex_runtime.py::run_codex_app_server_turn` | Codex subprocess turn, event projection, usage, persistence | Direct `AIAgent` access is acceptable only in built-in code | This is the proof consumer | Built-in runtime adapter produces v1 events through host services | Host | Thin adapter around current function, then narrow internals incrementally | Existing Codex integration/persist/event tests | Adapter must not alter prior Codex approvals or persistence |
@@ -19,7 +19,7 @@ PR #65982 `41def1e24e5223efa246d9fc57575db7181c6021`.
 | `tools/delegate_tool.py`, `async_delegation.py`, `process_registry.py` | Delegate task and background-result delivery | Claude native children and Hermes delegates have special delivery paths | Codex uses host tool execution/delegation | Optional host delegation capability with correlated events | Host facade; plugin maps native agents | Preserve host delegate path; plugin owns Claude-native agent mapping | Sync/background delegation, owner-fault, no-duplicate delivery | Process-local background behavior must not be overstated as durable |
 | `agent/turn_context.py` and prompt builders | Constructs stable prompt, memory, skill and project context | Prompt restore/build is skipped or rewritten by provider name | Codex consumes a host-composed turn | Immutable prompt snapshot and stable tool-schema hash | Host builds; plugin consumes/adapts | Build once before dispatch; plugin cannot mutate historical context | Prompt/tool hash and resume tests | Claude system-prompt append semantics may need a narrowly named capability |
 | Memory, skills and `session_search` bridge | Exposes memory injection, skill index and search | Claude runtime directly imports store/tool internals or MCP shims | Codex sees Hermes tools through its bridge | Host services expose tool schemas/execution and bounded context snapshot | Host security/state; plugin presentation | Use existing tool registration/execution; keep external memory routing host-owned | Memory, skill, routed review, search parity | Provider-native auxiliary review must not bypass routing policy |
-| `hermes_state.py::claude_sdk_session_id` | Persists Claude resume id on session row | One provider owns a dedicated column | Codex persists its thread/session state elsewhere | Versioned `RuntimeStateEnvelope` keyed by session/runtime | Host | Add/read/import first; retain legacy reader; no drop in v1 | Old session, import, resume, plugin removal | Schema migration policy and opaque payload size need caps |
+| Frozen candidate `hermes_state.py::claude_sdk_session_id` (absent on upstream main) | Persists Claude resume id on the candidate session row | One provider owns a dedicated column | Codex persists its thread/session state elsewhere | Versioned `RuntimeStateEnvelope` keyed by session/runtime | Host | Add generic tables on main; import the legacy candidate field only when present; never drop it in v1 | Old session, import, resume, plugin removal | Schema migration policy and opaque payload size need caps |
 | `agent/usage_pricing.py`, usage persistence | Records subscription billing and tokens | Core knows `claude-agent-sdk` is subscription-included | Codex usage maps into canonical accounting | `RuntimeUsageReceipt`; host validates and persists | Host persistence; plugin classification | Plugin emits fail-closed receipt; host rejects unknown execution | Exact provider/model/billing and mixed usage tests | A receipt cannot prove account billing without SDK rate-limit evidence |
 | `conversation_compression.py`, gateway compaction status | Skips host compression and surfaces native lifecycle | Branches on `api_mode=claude_agent_sdk` | Codex already emits native compaction observations | `CompactionOwnership.RUNTIME_NATIVE` plus typed lifecycle events | Host policy/event store; plugin emission | Replace provider checks with descriptor capability | Native compaction/watchdog/status tests | Exactly-once terminal compaction state across transport death |
 | `run_agent.py` close/interrupt/steer | Closes sessions, interrupts turns, handles steer | Direct `_claude_sdk_session` attribute checks | Direct `_codex_session` checks | Generic runtime handle lifecycle: cancel, close, optional steer | Host dispatcher; runtime implementation | One active handle per turn/session, registered cleanup | Interrupt, close, cache displacement, gateway teardown | Blocking SDK threads must terminate without orphan children |
@@ -30,8 +30,10 @@ PR #65982 `41def1e24e5223efa246d9fc57575db7181c6021`.
 
 ## Reconciliation result
 
-The live source supports the proposed single-seam premise. The dedicated
-`claude_sdk_session_id` field must be retained through the first compatibility
-release as an import source. The existing general plugin loader is sufficient;
-the model-provider profile loader alone is not, because it registers static
-transport metadata and does not own whole-turn lifecycle or unload cleanup.
+The live source supports the proposed single-seam premise. Upstream main has no
+dedicated Claude session field; the frozen downstream candidate's field remains
+an optional import source and must not be destructively removed. The existing
+general plugin loader is sufficient; the model-provider profile loader alone is
+not, because it registers static transport metadata and does not own whole-turn
+lifecycle or unload cleanup. The canonical host tool boundary is the existing
+agent executor funnel, not direct registry dispatch.

@@ -1,6 +1,8 @@
 # AgentRuntime Plugin API v1
 
-Status: Proposed on `codex/agent-runtime-plugin-api-v1`
+Status: Candidate contract on `codex/agent-runtime-plugin-api-v1`
+
+Host base: `NousResearch/hermes-agent@64b96bb5d2755f1d34347e1fb15924a97d652f31`
 
 Decision owner: Hermes core maintainers
 
@@ -79,10 +81,12 @@ actionable compatibility error. Credential resolution, dependency installation,
 SDK process creation, and model calls are forbidden during descriptor creation
 and registration.
 
-The runtime registry is profile-scoped through the existing plugin-manager
-scope. Built-in runtimes are registered by Hermes with the same descriptor and
-factory contract. Unloading a plugin disposes its runtime registration. A clean
-host with no third-party runtime plugin continues through its existing paths.
+The plugin runtime registry is profile-scoped through the existing
+plugin-manager scope. The built-in Codex runtime is supplied by host bootstrap
+as a `RuntimeRegistration` and resolved together with plugin registrations by
+the same pure resolver. Unloading a plugin disposes its runtime registration.
+A clean host with no matching third-party runtime continues through the
+ordinary Hermes conversation loop unchanged.
 
 ### Descriptor and capability handshake
 
@@ -96,21 +100,23 @@ host with no third-party runtime plugin continues through its existing paths.
 - only capability flags consumed by Codex or the Claude Agent SDK runtime.
 
 The machine-readable capability identifiers and descriptor schema live beside
-the public Python protocol in `agent/runtime_api.py`. Adding a capability
-requires a concrete built-in or external consumer and a contract test.
+the public Python protocol in `agent/runtime_api.py`; `runtime_api_manifest()`
+is the canonical JSON-compatible handshake. Adding a capability requires a
+concrete built-in or external consumer and a contract test.
 
 ### Whole-turn protocol
 
-`AgentRuntime.supports(request)` is a pure preflight decision.
+`AgentRuntime.preflight(request)` is a pure, side-effect-free support and
+compatibility decision.
 `AgentRuntime.run_turn(request, host)` is async and returns an async stream of
 typed `RuntimeEvent` values. The host owns event validation and terminal-state
 enforcement.
 
 `RuntimeTurnRequest` is immutable and contains normalized content, attachments,
-prompt snapshot, stable tool schemas and their hash, provider/model selection,
-cancellation context, correlation ids, and a generic runtime-state envelope. It
-contains no `AIAgent`, `SessionDB`, plugin manager, credential object, or mutable
-host internals.
+prompt snapshot, stable tool schemas and their SHA-256 hash, provider/model
+selection, correlation ids, and a generic runtime-state envelope. Cancellation
+is observed through the host facade. The request contains no `AIAgent`,
+`SessionDB`, plugin manager, credential object, or mutable host internals.
 
 `RuntimeHostServices` is a stable facade for:
 
@@ -121,7 +127,11 @@ host internals.
 - optional hybrid tool and delegation bridges exposed as host capabilities.
 
 Runtimes can request those operations but cannot substitute their own policy or
-obtain underlying host objects.
+obtain underlying host objects. Tool calls must traverse the canonical Hermes
+executor funnel: availability and toolset scope, request/execution middleware,
+pre-tool policy and approval, guardrails, activity/progress, underlying dispatch,
+post-tool and transform hooks, result normalization, persistence, and terminal
+accounting. Direct `tools.registry.dispatch()` is not a valid host facade.
 
 ### Events and terminal state
 
@@ -144,8 +154,9 @@ plugin declares fallback disabled for explicit Fable sessions.
 
 The host stores a versioned `RuntimeStateEnvelope` keyed by Hermes session and
 `runtime_id`. The payload is safe opaque JSON data and must not contain
-credentials. The first compatibility release adds and reads this envelope and
-may import `claude_sdk_session_id`; it does not drop that legacy field.
+credentials. Current upstream main has no Claude-specific session column. The
+frozen downstream candidate does; the first compatibility release may import
+that candidate's `claude_sdk_session_id` when present and never drops it.
 
 `RuntimeUsageReceipt` records runtime/provider/model, billing mode, cost status,
 available token/cache fields, replay/fallback classification, and safe

@@ -3,21 +3,29 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
 from agent.runtime_api import (
     AgentRuntime,
+    CompactionOwnership,
     RuntimeCancelledEvent,
     RuntimeCompletedEvent,
     RuntimeEvent,
     RuntimeFailedEvent,
     RuntimeFailure,
     RuntimeHostServices,
+    RuntimeDescriptor,
+    RuntimeRegistration,
     RuntimeSelection,
+    RuntimeStateEvent,
     RuntimeStateEnvelope,
+    RuntimeStatusEvent,
     RuntimeTurnRequest,
+    RuntimeUsageEvent,
     RuntimeUsageReceipt,
 )
 
@@ -36,9 +44,22 @@ class RuntimeDispatchResult:
     events: tuple[RuntimeEvent, ...]
 
 
+def _freeze_value(value: Any) -> Any:
+    """Deep-copy host-owned input into immutable public-contract values."""
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_value(item) for key, item in copy.deepcopy(dict(value)).items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(item) for item in copy.deepcopy(value))
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_value(item) for item in copy.deepcopy(value))
+    return copy.deepcopy(value)
+
+
 def _freeze_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     """Copy host-owned turn input before exposing it to a plugin."""
-    return MappingProxyType(copy.deepcopy(dict(value)))
+    return _freeze_value(value)
 
 
 def build_runtime_turn_request(
@@ -53,6 +74,12 @@ def build_runtime_turn_request(
     attachments: Sequence[Mapping[str, Any]] = (),
     correlation_id: str | None = None,
 ) -> RuntimeTurnRequest:
+    canonical_tool_schemas = json.dumps(
+        list(tool_schemas),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
     return RuntimeTurnRequest(
         selection=RuntimeSelection(
             provider=provider,
@@ -62,6 +89,7 @@ def build_runtime_turn_request(
         messages=tuple(_freeze_mapping(item) for item in messages),
         prompt_snapshot=str(prompt_snapshot),
         tool_schemas=tuple(_freeze_mapping(item) for item in tool_schemas),
+        tool_schema_hash=hashlib.sha256(canonical_tool_schemas).hexdigest(),
         session_state=session_state,
         attachments=tuple(_freeze_mapping(item) for item in attachments),
         correlation_id=correlation_id,
@@ -73,37 +101,46 @@ async def _collect_runtime_turn(
     request: RuntimeTurnRequest,
     host: RuntimeHostServices,
 ) -> RuntimeDispatchResult:
-    failure = runtime.preflight(request)
-    if failure is not None:
-        raise RuntimeExecutionError(failure.message, failure=failure)
+    try:
+        failure = runtime.preflight(request)
+        if failure is not None:
+            raise RuntimeExecutionError(failure.message, failure=failure)
 
-    events: list[RuntimeEvent] = []
-    terminal: RuntimeCompletedEvent | RuntimeCancelledEvent | RuntimeFailedEvent | None = None
-    async for event in runtime.run_turn(request, host):
-        events.append(event)
-        if isinstance(
-            event,
-            (RuntimeCompletedEvent, RuntimeCancelledEvent, RuntimeFailedEvent),
-        ):
+        events: list[RuntimeEvent] = []
+        terminal: RuntimeCompletedEvent | RuntimeCancelledEvent | RuntimeFailedEvent | None = None
+        async for event in runtime.run_turn(request, host):
             if terminal is not None:
                 raise RuntimeExecutionError(
-                    "runtime emitted more than one terminal event"
+                    "runtime emitted an event after its terminal event"
                 )
-            terminal = event
+            events.append(event)
+            if isinstance(event, RuntimeStatusEvent):
+                await host.emit_status(event.message)
+            elif isinstance(event, RuntimeStateEvent):
+                await host.persist_state(event.state)
+            elif isinstance(event, RuntimeUsageEvent):
+                await host.persist_usage(event.receipt)
+            if isinstance(
+                event,
+                (RuntimeCompletedEvent, RuntimeCancelledEvent, RuntimeFailedEvent),
+            ):
+                terminal = event
 
-    if terminal is None:
-        raise RuntimeExecutionError("runtime ended without a terminal event")
-    if isinstance(terminal, RuntimeFailedEvent):
-        raise RuntimeExecutionError(
-            terminal.failure.message,
-            failure=terminal.failure,
+        if terminal is None:
+            raise RuntimeExecutionError("runtime ended without a terminal event")
+        if isinstance(terminal, RuntimeFailedEvent):
+            raise RuntimeExecutionError(
+                terminal.failure.message,
+                failure=terminal.failure,
+            )
+        if isinstance(terminal, RuntimeCancelledEvent):
+            raise RuntimeExecutionError(f"runtime cancelled: {terminal.reason}")
+        return RuntimeDispatchResult(
+            response=terminal.result or {},
+            events=tuple(events),
         )
-    if isinstance(terminal, RuntimeCancelledEvent):
-        raise RuntimeExecutionError(f"runtime cancelled: {terminal.reason}")
-    return RuntimeDispatchResult(
-        response=terminal.result or {},
-        events=tuple(events),
-    )
+    finally:
+        await runtime.close()
 
 
 def run_runtime_sync(
@@ -139,6 +176,27 @@ class BuiltInCodexRuntime:
 
     async def close(self) -> None:
         return None
+
+
+def make_builtin_codex_registration(
+    runner: Callable[[], Mapping[str, Any]],
+) -> RuntimeRegistration:
+    """Return the host-owned Codex consumer for the shared runtime resolver."""
+    return RuntimeRegistration(
+        descriptor=RuntimeDescriptor(
+            runtime_id="hermes-codex-app-server",
+            plugin_version="builtin",
+            runtime_api_min=1,
+            runtime_api_max=1,
+            required_host_capabilities=frozenset({"cancellation_v1"}),
+            provider_ids=frozenset(),
+            api_modes=frozenset({"codex_app_server"}),
+            session_state_schema_version=1,
+            compaction_ownership=CompactionOwnership.RUNTIME_NATIVE,
+        ),
+        factory=lambda: BuiltInCodexRuntime(runner),
+        plugin_id="hermes-core",
+    )
 
 
 class HermesRuntimeHostServices:

@@ -2077,19 +2077,42 @@ def run_conversation(
     # stale prior turn's usage.
     agent._last_turn_usage = None
 
-    # Optional opt-in runtime: if api_mode == codex_app_server, hand the
-    # turn to the codex app-server subprocess (terminal/file ops/patching
-    # all run inside Codex). Default Hermes path is bypassed entirely.
-    # See agent/transports/codex_app_server_session.py for the adapter
-    # and references/codex-app-server-runtime.md for the rationale.
-    if agent.api_mode == "codex_app_server":
-        from agent.runtime_dispatch import (
-            BuiltInCodexRuntime,
-            HermesRuntimeHostServices,
-            build_runtime_turn_request,
-            run_runtime_sync,
-        )
+    # Whole-turn runtimes share one provider-neutral resolver. The built-in
+    # Codex adapter and independently packaged runtimes are descriptor entries
+    # in the same selection set; if nothing matches, Hermes continues through
+    # its ordinary conversation loop unchanged.
+    from agent.runtime_api import RuntimeSelection, resolve_runtime_registration
+    from agent.runtime_dispatch import (
+        HermesRuntimeHostServices,
+        build_runtime_turn_request,
+        make_builtin_codex_registration,
+        run_runtime_sync,
+    )
+    from hermes_cli.plugins import discover_plugins, get_plugin_manager
 
+    discover_plugins()
+    plugin_manager = get_plugin_manager()
+    builtin_codex = make_builtin_codex_registration(
+        lambda: agent._run_codex_app_server_turn(
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=_should_review_memory,
+        )
+    )
+    runtime_registration = resolve_runtime_registration(
+        RuntimeSelection(
+            provider=agent.provider,
+            model=agent.model,
+            api_mode=agent.api_mode,
+        ),
+        (
+            builtin_codex,
+            *plugin_manager.iter_agent_runtime_registrations(),
+        ),
+    )
+    if runtime_registration is not None:
         request = build_runtime_turn_request(
             provider=agent.provider,
             model=agent.model,
@@ -2099,17 +2122,8 @@ def run_conversation(
             tool_schemas=getattr(agent, "tools", ()) or (),
             correlation_id=effective_task_id,
         )
-        runtime = BuiltInCodexRuntime(
-            lambda: agent._run_codex_app_server_turn(
-                user_message=user_message,
-                original_user_message=original_user_message,
-                messages=messages,
-                effective_task_id=effective_task_id,
-                should_review_memory=_should_review_memory,
-            )
-        )
         dispatched = run_runtime_sync(
-            runtime,
+            runtime_registration.factory(),
             request,
             HermesRuntimeHostServices(agent),
         )

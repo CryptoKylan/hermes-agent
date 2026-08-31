@@ -34,7 +34,7 @@ HOST_RUNTIME_CAPABILITIES: FrozenSet[str] = frozenset(
         "compaction_events_v1",
         "host_approval_v1",
         "host_status_v1",
-        "host_tool_execution",
+        "host_tool_execution_v1",
         "runtime_state_v1",
         "usage_receipts_v1",
     }
@@ -54,6 +54,13 @@ class RuntimeRegistrationError(RuntimeError):
 class CompactionOwnership(str, Enum):
     HOST = "host"
     RUNTIME_NATIVE = "runtime_native"
+
+
+class RuntimeCompactionPhase(str, Enum):
+    STARTED = "started"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    WATCHDOG = "watchdog"
 
 
 class RuntimeFailurePhase(str, Enum):
@@ -170,6 +177,7 @@ class RuntimeTurnRequest:
     messages: Sequence[Mapping[str, Any]]
     prompt_snapshot: str
     tool_schemas: Sequence[Mapping[str, Any]]
+    tool_schema_hash: str
     session_state: RuntimeStateEnvelope | None = None
     attachments: Sequence[Mapping[str, Any]] = ()
     correlation_id: str | None = None
@@ -185,6 +193,32 @@ class RuntimeContentEvent:
 class RuntimeStatusEvent:
     message: str
     kind: RuntimeEventKind = field(default=RuntimeEventKind.STATUS, init=False)
+
+
+@dataclass(frozen=True)
+class RuntimeToolRequestEvent:
+    request_id: str
+    name: str
+    arguments: Mapping[str, Any]
+    kind: RuntimeEventKind = field(default=RuntimeEventKind.TOOL_REQUEST, init=False)
+
+
+@dataclass(frozen=True)
+class RuntimeApprovalRequestEvent:
+    request_id: str
+    action: str
+    details: Mapping[str, Any]
+    kind: RuntimeEventKind = field(
+        default=RuntimeEventKind.APPROVAL_REQUEST,
+        init=False,
+    )
+
+
+@dataclass(frozen=True)
+class RuntimeCompactionEvent:
+    phase: RuntimeCompactionPhase
+    details: Mapping[str, Any] = field(default_factory=dict)
+    kind: RuntimeEventKind = field(default=RuntimeEventKind.COMPACTION, init=False)
 
 
 @dataclass(frozen=True)
@@ -220,6 +254,9 @@ class RuntimeFailedEvent:
 RuntimeEvent: TypeAlias = (
     RuntimeContentEvent
     | RuntimeStatusEvent
+    | RuntimeToolRequestEvent
+    | RuntimeApprovalRequestEvent
+    | RuntimeCompactionEvent
     | RuntimeStateEvent
     | RuntimeUsageEvent
     | RuntimeCompletedEvent
@@ -272,6 +309,27 @@ class RuntimeRegistration:
     plugin_id: str
 
 
+def resolve_runtime_registration(
+    selection: RuntimeSelection,
+    registrations: Sequence[RuntimeRegistration],
+) -> RuntimeRegistration | None:
+    """Resolve built-in and plugin runtimes through one pure routing path."""
+    matches = [
+        registration
+        for registration in registrations
+        if registration.descriptor.supports(selection)
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        runtime_ids = sorted(item.descriptor.runtime_id for item in matches)
+        raise RuntimeRegistrationError(
+            "multiple runtimes support the same selection: "
+            + ", ".join(runtime_ids)
+        )
+    return matches[0]
+
+
 def validate_runtime_descriptor(descriptor: RuntimeDescriptor) -> None:
     """Fail closed before a runtime factory, credential, or SDK is touched."""
     if not isinstance(descriptor, RuntimeDescriptor):
@@ -319,4 +377,5 @@ def runtime_api_manifest() -> dict[str, Any]:
         "host_capabilities": sorted(HOST_RUNTIME_CAPABILITIES),
         "event_kinds": [kind.value for kind in RuntimeEventKind],
         "failure_phases": [phase.value for phase in RuntimeFailurePhase],
+        "compaction_phases": [phase.value for phase in RuntimeCompactionPhase],
     }
