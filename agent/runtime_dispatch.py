@@ -231,9 +231,10 @@ def make_builtin_codex_registration(
 class HermesRuntimeHostServices:
     """The only stateful Hermes surface available to runtime plugins."""
 
-    def __init__(self, agent: Any, *, task_id: str):
+    def __init__(self, agent: Any, *, task_id: str, runtime_id: str):
         self._agent = agent
         self._task_id = str(task_id)
+        self._runtime_id = str(runtime_id)
         self._tool_call_count = 0
         allowed = set(getattr(agent, "valid_tool_names", ()) or ())
         for schema in getattr(agent, "tools", ()) or ():
@@ -319,6 +320,10 @@ class HermesRuntimeHostServices:
             touch(message)
 
     async def persist_state(self, state: RuntimeStateEnvelope) -> None:
+        if state.runtime_id != self._runtime_id:
+            raise RuntimeExecutionError(
+                "runtime state identity does not match the selected runtime"
+            )
         database = getattr(self._agent, "_session_db", None)
         session_id = getattr(self._agent, "session_id", None)
         if database is None or not session_id:
@@ -328,12 +333,19 @@ class HermesRuntimeHostServices:
         database.update_runtime_state(session_id, state)
 
     async def persist_usage(self, receipt: RuntimeUsageReceipt) -> None:
+        if receipt.runtime_id != self._runtime_id:
+            raise RuntimeExecutionError(
+                "runtime usage identity does not match the selected runtime"
+            )
         database = getattr(self._agent, "_session_db", None)
         session_id = getattr(self._agent, "session_id", None)
         if database is None or not session_id:
             raise RuntimeExecutionError(
                 "runtime usage persistence requires an active Hermes session"
             )
+        inserted = database.record_runtime_usage_receipt(session_id, receipt)
+        if not inserted:
+            return
         database.queue_token_counts(
             session_id,
             input_tokens=receipt.input_tokens,

@@ -21,10 +21,12 @@ from agent.runtime_api import (
     RuntimeUsageReceipt,
 )
 from agent.runtime_dispatch import (
+    HermesRuntimeHostServices,
     RuntimeExecutionError,
     build_runtime_turn_request,
     run_runtime_sync,
 )
+from model_tools import _run_async
 
 
 class _HostServices:
@@ -137,6 +139,92 @@ def test_dispatch_rejects_unknown_event_types_and_closes_runtime_once():
         run_runtime_sync(runtime, _request(), _HostServices())
 
     assert runtime.close_calls == 1
+
+
+class _RuntimeDatabase:
+    def __init__(self):
+        self.states = []
+        self.receipts = []
+        self.aggregate_receipts = []
+        self.inserted = True
+
+    def update_runtime_state(self, session_id, state):
+        self.states.append((session_id, state))
+
+    def record_runtime_usage_receipt(self, session_id, receipt):
+        self.receipts.append((session_id, receipt))
+        return self.inserted
+
+    def queue_token_counts(self, session_id, **kwargs):
+        self.aggregate_receipts.append((session_id, kwargs))
+
+
+class _RuntimeAgent:
+    valid_tool_names = frozenset()
+    tools = ()
+    session_id = "synthetic-session"
+    _interrupt_requested = False
+
+    def __init__(self):
+        self._session_db = _RuntimeDatabase()
+
+
+def test_host_persists_runtime_state_and_idempotent_usage_for_selected_runtime():
+    agent = _RuntimeAgent()
+    host = HermesRuntimeHostServices(
+        agent,
+        task_id="synthetic-task",
+        runtime_id="example-runtime",
+    )
+    state = RuntimeStateEnvelope(
+        runtime_id="example-runtime",
+        schema_version=1,
+        state={"external": "synthetic"},
+    )
+    receipt = RuntimeUsageReceipt(
+        runtime_id="example-runtime",
+        provider="example",
+        model="example-large",
+        billing_mode="subscription_included",
+        cost_status="included",
+        correlation_id="synthetic-turn",
+    )
+
+    _run_async(host.persist_state(state))
+    _run_async(host.persist_usage(receipt))
+    assert agent._session_db.states == [("synthetic-session", state)]
+    assert agent._session_db.receipts == [("synthetic-session", receipt)]
+    assert len(agent._session_db.aggregate_receipts) == 1
+
+    agent._session_db.inserted = False
+    _run_async(host.persist_usage(receipt))
+    assert len(agent._session_db.receipts) == 2
+    assert len(agent._session_db.aggregate_receipts) == 1
+
+
+def test_host_rejects_state_and_usage_for_a_different_runtime():
+    host = HermesRuntimeHostServices(
+        _RuntimeAgent(),
+        task_id="synthetic-task",
+        runtime_id="example-runtime",
+    )
+    wrong_state = RuntimeStateEnvelope(
+        runtime_id="other-runtime",
+        schema_version=1,
+        state={},
+    )
+    wrong_receipt = RuntimeUsageReceipt(
+        runtime_id="other-runtime",
+        provider="example",
+        model="example-large",
+        billing_mode="subscription_included",
+        cost_status="included",
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="identity does not match"):
+        _run_async(host.persist_state(wrong_state))
+    with pytest.raises(RuntimeExecutionError, match="identity does not match"):
+        _run_async(host.persist_usage(wrong_receipt))
 
 
 class _PostTerminalRuntime:

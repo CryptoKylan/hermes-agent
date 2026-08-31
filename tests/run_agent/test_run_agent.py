@@ -1705,7 +1705,11 @@ class TestExecuteToolCalls:
             "hermes_cli.lifecycle.invoke_hook",
             lambda hook_name, **kwargs: hook_calls.append((hook_name, kwargs)) or [],
         )
-        host = HermesRuntimeHostServices(agent, task_id="synthetic-task")
+        host = HermesRuntimeHostServices(
+            agent,
+            task_id="synthetic-task",
+            runtime_id="example-runtime",
+        )
 
         with patch(
             "run_agent.handle_function_call", return_value="canonical result"
@@ -1727,7 +1731,11 @@ class TestExecuteToolCalls:
         from agent.runtime_dispatch import HermesRuntimeHostServices, RuntimeExecutionError
         from model_tools import _run_async
 
-        host = HermesRuntimeHostServices(agent, task_id="synthetic-task")
+        host = HermesRuntimeHostServices(
+            agent,
+            task_id="synthetic-task",
+            runtime_id="example-runtime",
+        )
 
         with (
             patch("run_agent.handle_function_call") as dispatch,
@@ -1742,7 +1750,11 @@ class TestExecuteToolCalls:
         from model_tools import _run_async
 
         agent._interrupt_requested = True
-        host = HermesRuntimeHostServices(agent, task_id="synthetic-task")
+        host = HermesRuntimeHostServices(
+            agent,
+            task_id="synthetic-task",
+            runtime_id="example-runtime",
+        )
 
         with patch("run_agent.handle_function_call") as dispatch:
             result = _run_async(host.execute_tool("web_search", {"q": "runtime"}))

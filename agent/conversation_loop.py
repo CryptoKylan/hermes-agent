@@ -2113,19 +2113,36 @@ def run_conversation(
         ),
     )
     if runtime_registration is not None:
+        runtime_session_state = None
+        runtime_database = getattr(agent, "_session_db", None)
+        runtime_session_id = getattr(agent, "session_id", None)
+        if runtime_database is not None and runtime_session_id:
+            runtime_session_state = runtime_database.get_runtime_state(
+                runtime_session_id,
+                runtime_registration.descriptor.runtime_id,
+            )
         request = build_runtime_turn_request(
             provider=agent.provider,
             model=agent.model,
             api_mode=agent.api_mode,
             messages=messages,
-            prompt_snapshot=getattr(agent, "system_prompt", "") or "",
+            prompt_snapshot=(
+                getattr(agent, "_cached_system_prompt", "")
+                or getattr(agent, "system_prompt", "")
+                or ""
+            ),
             tool_schemas=getattr(agent, "tools", ()) or (),
+            session_state=runtime_session_state,
             correlation_id=effective_task_id,
         )
         dispatched = run_runtime_sync(
             runtime_registration.factory(),
             request,
-            HermesRuntimeHostServices(agent, task_id=effective_task_id),
+            HermesRuntimeHostServices(
+                agent,
+                task_id=effective_task_id,
+                runtime_id=runtime_registration.descriptor.runtime_id,
+            ),
         )
         return dict(dispatched.response)
 

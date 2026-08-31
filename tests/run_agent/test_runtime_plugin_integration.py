@@ -22,6 +22,7 @@ class _ExternalRuntime:
 
     async def run_turn(self, request, host):
         self._counters["turn"] += 1
+        self._counters["prompt_snapshot"] = request.prompt_snapshot
         yield RuntimeCompletedEvent(
             result={
                 "final_response": "external runtime reply",
@@ -42,7 +43,13 @@ def test_external_plugin_runtime_is_selected_before_the_ordinary_model_loop(
     manager = PluginManager()
     manager._discovered = True
     context = PluginContext(PluginManifest(name="external-runtime"), manager)
-    counters = {"factory": 0, "preflight": 0, "turn": 0, "close": 0}
+    counters = {
+        "factory": 0,
+        "preflight": 0,
+        "turn": 0,
+        "close": 0,
+        "prompt_snapshot": None,
+    }
 
     def factory():
         counters["factory"] += 1
@@ -75,8 +82,15 @@ def test_external_plugin_runtime_is_selected_before_the_ordinary_model_loop(
         skip_context_files=True,
         skip_memory=True,
     )
+    agent._cached_system_prompt = "composed synthetic prompt"
 
     result = agent.run_conversation("hello")
 
     assert result["final_response"] == "external runtime reply"
-    assert counters == {"factory": 1, "preflight": 1, "turn": 1, "close": 1}
+    assert counters == {
+        "factory": 1,
+        "preflight": 1,
+        "turn": 1,
+        "close": 1,
+        "prompt_snapshot": "composed synthetic prompt",
+    }
