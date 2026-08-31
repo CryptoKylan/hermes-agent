@@ -357,6 +357,144 @@ def test_dispatch_returns_classified_failure_without_authorizing_fallback():
     assert runtime.close_calls == 0
 
 
+def test_host_tool_execution_overrides_runtime_replay_safe_claim():
+    class _ToolAgent(_RuntimeAgent):
+        valid_tool_names = frozenset({"synthetic_tool"})
+
+        def _execute_tool_calls(self, assistant_message, messages, task_id):
+            tool_call = assistant_message.tool_calls[0]
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": "tool completed",
+                }
+            )
+
+    class _ReplayClaimingRuntime:
+        def preflight(self, request):
+            return None
+
+        async def run_turn(self, request, host) -> AsyncIterator[object]:
+            await host.execute_tool("synthetic_tool", {"value": "one"})
+            yield RuntimeFailedEvent(
+                failure=RuntimeFailure(
+                    code="synthetic_failure",
+                    message="synthetic failure",
+                    phase=RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT,
+                    replay_safe=True,
+                    retryable=True,
+                )
+            )
+
+        async def close(self):
+            return None
+
+    host = HermesRuntimeHostServices(
+        _ToolAgent(),
+        task_id="synthetic-task",
+        runtime_id="example-runtime",
+    )
+
+    result = run_runtime_sync(_ReplayClaimingRuntime(), _request(), host)
+
+    assert result.failure is not None
+    assert result.failure.phase is RuntimeFailurePhase.AFTER_SIDE_EFFECTS
+    assert result.failure.replay_safe is False
+    assert result.failure.retryable is True
+    assert result.replay_safe is False
+    assert isinstance(result.terminal, RuntimeFailedEvent)
+    assert result.terminal.failure is result.failure
+    assert result.events[-1] is result.terminal
+
+
+def test_runtime_replay_safe_claim_survives_without_host_side_effects():
+    class _ReplayClaimingRuntime:
+        def preflight(self, request):
+            return None
+
+        async def run_turn(self, request, host) -> AsyncIterator[object]:
+            yield RuntimeFailedEvent(
+                failure=RuntimeFailure(
+                    code="synthetic_failure",
+                    message="synthetic failure",
+                    phase=RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT,
+                    replay_safe=True,
+                    retryable=True,
+                )
+            )
+
+        async def close(self):
+            return None
+
+    result = run_runtime_sync(_ReplayClaimingRuntime(), _request(), _HostServices())
+
+    assert result.failure is not None
+    assert result.failure.phase is RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT
+    assert result.failure.replay_safe is True
+    assert result.replay_safe is True
+
+
+def test_prior_turn_tool_execution_does_not_override_current_replay_safe_claim():
+    class _ToolAgent(_RuntimeAgent):
+        valid_tool_names = frozenset({"synthetic_tool"})
+
+        def _execute_tool_calls(self, assistant_message, messages, task_id):
+            tool_call = assistant_message.tool_calls[0]
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": "tool completed",
+                }
+            )
+
+    class _ToolThenCompleteRuntime:
+        def preflight(self, request):
+            return None
+
+        async def run_turn(self, request, host) -> AsyncIterator[object]:
+            await host.execute_tool("synthetic_tool", {"value": "one"})
+            yield RuntimeCompletedEvent(result={"final_response": "done"})
+
+        async def close(self):
+            return None
+
+    class _ReplayClaimingRuntime:
+        def preflight(self, request):
+            return None
+
+        async def run_turn(self, request, host) -> AsyncIterator[object]:
+            yield RuntimeFailedEvent(
+                failure=RuntimeFailure(
+                    code="synthetic_failure",
+                    message="synthetic failure",
+                    phase=RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT,
+                    replay_safe=True,
+                    retryable=True,
+                )
+            )
+
+        async def close(self):
+            return None
+
+    host = HermesRuntimeHostServices(
+        _ToolAgent(),
+        task_id="synthetic-turn-1",
+        runtime_id="example-runtime",
+    )
+    first = run_runtime_sync(_ToolThenCompleteRuntime(), _request(), host)
+    assert first.completed is True
+
+    host.refresh_turn("synthetic-turn-2")
+    second = run_runtime_sync(_ReplayClaimingRuntime(), _request(), host)
+
+    assert second.failure is not None
+    assert second.failure.phase is RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT
+    assert second.failure.replay_safe is True
+    assert second.replay_safe is True
+
+
 class _ExplodingRuntime:
     def __init__(self):
         self.close_calls = 0
