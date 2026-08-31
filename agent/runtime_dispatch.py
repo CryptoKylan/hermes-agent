@@ -12,8 +12,11 @@ from typing import Any, Callable, Mapping, Sequence
 from agent.runtime_api import (
     AgentRuntime,
     CompactionOwnership,
+    RuntimeApprovalRequestEvent,
     RuntimeCancelledEvent,
+    RuntimeCompactionEvent,
     RuntimeCompletedEvent,
+    RuntimeContentEvent,
     RuntimeEvent,
     RuntimeFailedEvent,
     RuntimeFailure,
@@ -24,9 +27,24 @@ from agent.runtime_api import (
     RuntimeStateEvent,
     RuntimeStateEnvelope,
     RuntimeStatusEvent,
+    RuntimeToolRequestEvent,
     RuntimeTurnRequest,
     RuntimeUsageEvent,
     RuntimeUsageReceipt,
+)
+
+
+_RUNTIME_EVENT_TYPES = (
+    RuntimeContentEvent,
+    RuntimeStatusEvent,
+    RuntimeToolRequestEvent,
+    RuntimeApprovalRequestEvent,
+    RuntimeCompactionEvent,
+    RuntimeStateEvent,
+    RuntimeUsageEvent,
+    RuntimeCompletedEvent,
+    RuntimeCancelledEvent,
+    RuntimeFailedEvent,
 )
 
 
@@ -80,6 +98,13 @@ def build_runtime_turn_request(
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
+    frozen_session_state = None
+    if session_state is not None:
+        frozen_session_state = RuntimeStateEnvelope(
+            runtime_id=str(session_state.runtime_id),
+            schema_version=int(session_state.schema_version),
+            state=_freeze_mapping(session_state.state),
+        )
     return RuntimeTurnRequest(
         selection=RuntimeSelection(
             provider=provider,
@@ -90,7 +115,7 @@ def build_runtime_turn_request(
         prompt_snapshot=str(prompt_snapshot),
         tool_schemas=tuple(_freeze_mapping(item) for item in tool_schemas),
         tool_schema_hash=hashlib.sha256(canonical_tool_schemas).hexdigest(),
-        session_state=session_state,
+        session_state=frozen_session_state,
         attachments=tuple(_freeze_mapping(item) for item in attachments),
         correlation_id=correlation_id,
     )
@@ -109,6 +134,10 @@ async def _collect_runtime_turn(
         events: list[RuntimeEvent] = []
         terminal: RuntimeCompletedEvent | RuntimeCancelledEvent | RuntimeFailedEvent | None = None
         async for event in runtime.run_turn(request, host):
+            if not isinstance(event, _RUNTIME_EVENT_TYPES):
+                raise RuntimeExecutionError(
+                    f"runtime emitted unsupported event type: {type(event).__name__}"
+                )
             if terminal is not None:
                 raise RuntimeExecutionError(
                     "runtime emitted an event after its terminal event"

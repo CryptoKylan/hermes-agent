@@ -63,6 +63,35 @@ def _request():
     )
 
 
+def test_runtime_turn_request_deep_freezes_state_and_host_inputs():
+    messages = [{"role": "user", "content": {"parts": ["hello"]}}]
+    tools = [{"type": "function", "function": {"name": "pwd"}}]
+    state_data = {"resume": {"external": "synthetic"}}
+
+    request = build_runtime_turn_request(
+        provider="example",
+        model="example-large",
+        api_mode="example_runtime",
+        messages=messages,
+        prompt_snapshot="stable prompt",
+        tool_schemas=tools,
+        session_state=RuntimeStateEnvelope(
+            runtime_id="example-runtime",
+            schema_version=1,
+            state=state_data,
+        ),
+    )
+    messages[0]["content"]["parts"].append("late mutation")
+    tools[0]["function"]["name"] = "terminal"
+    state_data["resume"]["external"] = "late mutation"
+
+    assert request.messages[0]["content"]["parts"] == ("hello",)
+    assert request.tool_schemas[0]["function"]["name"] == "pwd"
+    assert request.session_state.state["resume"]["external"] == "synthetic"
+    with pytest.raises(TypeError):
+        request.session_state.state["resume"]["external"] = "blocked"
+
+
 def test_public_runtime_request_events_are_typed_and_frozen():
     tool = RuntimeToolRequestEvent(
         request_id="tool-1",
@@ -84,6 +113,30 @@ def test_public_runtime_request_events_are_typed_and_frozen():
     assert compaction.kind is RuntimeEventKind.COMPACTION
     with pytest.raises(Exception):
         tool.name = "terminal"
+
+
+class _UnknownEventRuntime:
+    def __init__(self):
+        self.close_calls = 0
+
+    def preflight(self, request):
+        return None
+
+    async def run_turn(self, request, host) -> AsyncIterator[object]:
+        yield object()
+        yield RuntimeCompletedEvent(result={"final_response": "done"})
+
+    async def close(self):
+        self.close_calls += 1
+
+
+def test_dispatch_rejects_unknown_event_types_and_closes_runtime_once():
+    runtime = _UnknownEventRuntime()
+
+    with pytest.raises(RuntimeExecutionError, match="unsupported event type"):
+        run_runtime_sync(runtime, _request(), _HostServices())
+
+    assert runtime.close_calls == 1
 
 
 class _PostTerminalRuntime:
