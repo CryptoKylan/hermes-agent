@@ -51,9 +51,11 @@ import asyncio
 import concurrent.futures
 import logging
 import time
+from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
+from agent.message_content import _field
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
@@ -67,6 +69,53 @@ _QUERY_CLOSE_TIMEOUT = 5.0
 
 class ClaudeSdkAuxError(RuntimeError):
     """Raised when a one-shot auxiliary SDK query cannot produce text."""
+
+
+_IMAGE_PART_TYPES = {"image", "image_url", "input_image"}
+_IMAGE_UNSUPPORTED_ERROR = (
+    "Claude Agent SDK auxiliary chat is text-only; image inputs are not "
+    "forwarded. Route this request through an image-capable provider "
+    "configured with auxiliary.vision."
+)
+
+
+def _contains_image_input(
+    value: Any, *, _seen: set[int] | None = None, _depth: int = 0
+) -> bool:
+    """Detect image parts in bounded content trees without reading payloads."""
+    if value is None or isinstance(value, (str, bytes)):
+        return False
+    if _depth > 32:
+        # Unexpectedly deep rich content is not safe to flatten as text.
+        return True
+
+    part_type = str(_field(value, "type") or "").strip().lower()
+    if part_type in _IMAGE_PART_TYPES:
+        return True
+
+    if _seen is None:
+        _seen = set()
+    track_identity = isinstance(value, (Mapping, list, tuple)) or _field(
+        value, "content"
+    ) is not None
+    if track_identity:
+        identity = id(value)
+        if identity in _seen:
+            return False
+        _seen.add(identity)
+
+    if isinstance(value, (list, tuple)):
+        return any(
+            _contains_image_input(item, _seen=_seen, _depth=_depth + 1)
+            for item in value
+        )
+
+    nested_content = _field(value, "content")
+    if nested_content is not None:
+        return _contains_image_input(
+            nested_content, _seen=_seen, _depth=_depth + 1
+        )
+    return False
 
 
 def _render_message_content(content: Any) -> str:
@@ -358,6 +407,9 @@ class _AuxCompletions:
         model = str(kwargs.get("model") or self._owner.default_model or DEFAULT_MODEL)
         messages = kwargs.get("messages") or []
         timeout = float(kwargs.get("timeout") or self._owner.timeout)
+
+        if _contains_image_input(messages):
+            raise ClaudeSdkAuxError(_IMAGE_UNSUPPORTED_ERROR)
 
         if kwargs.get("stream"):
             # Auxiliary callers never need token streaming; refusing here is

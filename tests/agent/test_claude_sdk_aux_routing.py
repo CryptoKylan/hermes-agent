@@ -7,7 +7,7 @@ import builtins
 import concurrent.futures
 import sys
 import threading
-from types import ModuleType
+from types import MappingProxyType, ModuleType, SimpleNamespace
 
 import pytest
 
@@ -291,6 +291,204 @@ def test_prompt_formatter_preserves_roles_and_only_text_content():
     assert "User:\nhello" in prompt
     assert "Tool result:\ntool output" in prompt
     assert "secret-url" not in prompt
+
+
+@pytest.mark.parametrize(
+    "image_part",
+    [
+        {
+            "type": "image_url",
+            "image_url": {"url": "https://example.invalid/private.png?token=secret"},
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,SECRETBASE64"},
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": "file:///home/user/private.png"},
+        },
+        {"type": "image_url", "image_url": "malformed-secret-image"},
+        {"type": "input_image", "image_url": "https://example.invalid/input.png"},
+        {"type": "image", "source": {"type": "base64", "data": "SECRETIMAGE"}},
+    ],
+)
+def test_sdk_aux_rejects_images_before_query_without_echoing_payload(
+    monkeypatch, image_part
+):
+    calls = []
+
+    async def _must_not_query(prompt, *, model):
+        calls.append((prompt, model))
+        return "wrong text-only answer", None, "stop"
+
+    monkeypatch.setattr(AUX, "_collect_text", _must_not_query)
+    client = ClaudeSdkAuxClient()
+
+    with pytest.raises(ClaudeSdkAuxError) as raised:
+        client.chat.completions.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image precisely."},
+                        image_part,
+                        {"type": "text", "text": "Do not guess."},
+                    ],
+                }
+            ]
+        )
+
+    error = str(raised.value)
+    assert "auxiliary.vision" in error
+    assert "image" in error.lower()
+    assert "secret" not in error.lower()
+    assert "example.invalid" not in error
+    assert calls == []
+
+
+def test_async_sdk_aux_rejects_image_before_query(monkeypatch):
+    calls = []
+
+    async def _must_not_query(prompt, *, model):
+        calls.append((prompt, model))
+        return "wrong text-only answer", None, "stop"
+
+    monkeypatch.setattr(AUX, "_collect_text", _must_not_query)
+    client = M.resolve_provider_client(
+        "claude-agent-sdk", model="claude-sonnet-5", async_mode=True
+    )[0]
+
+    async def _call():
+        return await client.chat.completions.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Inspect this."},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.invalid/secret.png"},
+                        },
+                    ],
+                }
+            ]
+        )
+
+    with pytest.raises(ClaudeSdkAuxError, match="auxiliary.vision"):
+        asyncio.run(_call())
+    assert calls == []
+
+
+def test_sdk_aux_allows_text_that_mentions_an_image_url(monkeypatch):
+    calls = []
+
+    async def _collect(
+        prompt, *, model, cancel_check=None, progress_hook=None
+    ):
+        calls.append((prompt, model))
+        return "text-only answer", None, "stop"
+
+    monkeypatch.setattr(AUX, "_collect_text", _collect)
+    client = ClaudeSdkAuxClient()
+
+    response = client.chat.completions.create(
+        messages=[
+            {
+                "role": "user",
+                "content": "Summarize the text https://example.invalid/image.png",
+            }
+        ]
+    )
+
+    assert response.choices[0].message.content == "text-only answer"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "image_part",
+    [
+        SimpleNamespace(
+            type="image_url",
+            image_url={"url": "https://example.invalid/object-secret.png"},
+        ),
+        MappingProxyType(
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.invalid/mapping-secret.png"},
+            }
+        ),
+    ],
+)
+def test_sdk_aux_rejects_object_and_mapping_image_parts_before_query(
+    monkeypatch, image_part
+):
+    calls = []
+
+    async def _must_not_query(prompt, *, model):
+        calls.append((prompt, model))
+        return "wrong text-only answer", None, "stop"
+
+    monkeypatch.setattr(AUX, "_collect_text", _must_not_query)
+
+    with pytest.raises(ClaudeSdkAuxError, match="auxiliary.vision"):
+        ClaudeSdkAuxClient().chat.completions.create(
+            messages=[{"role": "user", "content": ["inspect", image_part]}]
+        )
+
+    assert calls == []
+
+
+def test_sdk_aux_cycle_before_image_fails_closed_without_recursion_error(monkeypatch):
+    calls = []
+    content = []
+    content.append(content)
+    content.append(
+        {
+            "type": "image_url",
+            "image_url": {"url": "https://example.invalid/cycle-secret.png"},
+        }
+    )
+
+    async def _must_not_query(prompt, *, model):
+        calls.append((prompt, model))
+        return "wrong text-only answer", None, "stop"
+
+    monkeypatch.setattr(AUX, "_collect_text", _must_not_query)
+
+    with pytest.raises(ClaudeSdkAuxError, match="auxiliary.vision"):
+        ClaudeSdkAuxClient().chat.completions.create(
+            messages=[{"role": "user", "content": content}]
+        )
+
+    assert calls == []
+
+
+def test_sdk_aux_allows_benign_metadata_image_url_key(monkeypatch):
+    calls = []
+
+    async def _collect(
+        prompt, *, model, cancel_check=None, progress_hook=None
+    ):
+        calls.append((prompt, model))
+        return "text-only answer", None, "stop"
+
+    monkeypatch.setattr(AUX, "_collect_text", _collect)
+
+    response = ClaudeSdkAuxClient().chat.completions.create(
+        messages=[
+            {
+                "role": "user",
+                "content": {
+                    "text": "Summarize this metadata record.",
+                    "meta": {"image_url": "not-a-content-part"},
+                },
+            }
+        ]
+    )
+
+    assert response.choices[0].message.content == "text-only answer"
+    assert len(calls) == 1
 
 
 def test_sdk_aux_query_reports_progress_for_each_consumed_message(monkeypatch):
