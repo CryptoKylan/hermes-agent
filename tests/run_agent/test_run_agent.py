@@ -1692,6 +1692,64 @@ class TestFormatToolsForSystemMessage:
 
 
 class TestExecuteToolCalls:
+    def test_runtime_host_services_use_canonical_tool_executor(self, agent, monkeypatch):
+        from agent.runtime_dispatch import HermesRuntimeHostServices
+        from model_tools import _run_async
+
+        hook_calls = []
+        agent.session_id = "synthetic-session"
+        agent._current_turn_id = "synthetic-turn"
+        agent._current_api_request_id = "synthetic-request"
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
+        monkeypatch.setattr(
+            "hermes_cli.lifecycle.invoke_hook",
+            lambda hook_name, **kwargs: hook_calls.append((hook_name, kwargs)) or [],
+        )
+        host = HermesRuntimeHostServices(agent, task_id="synthetic-task")
+
+        with patch(
+            "run_agent.handle_function_call", return_value="canonical result"
+        ) as dispatch:
+            result = _run_async(host.execute_tool("web_search", {"q": "runtime"}))
+
+        assert result == "canonical result"
+        dispatch.assert_called_once()
+        args, kwargs = dispatch.call_args
+        assert args[:3] == ("web_search", {"q": "runtime"}, "synthetic-task")
+        assert set(kwargs["enabled_tools"]) == agent.valid_tool_names
+        pre_calls = [item for item in hook_calls if item[0] == "pre_tool_call"]
+        post_calls = [item for item in hook_calls if item[0] == "post_tool_call"]
+        assert len(pre_calls) == 1
+        assert len(post_calls) == 1
+        assert post_calls[0][1]["status"] == "ok"
+
+    def test_runtime_host_services_reject_tools_outside_session_scope(self, agent):
+        from agent.runtime_dispatch import HermesRuntimeHostServices, RuntimeExecutionError
+        from model_tools import _run_async
+
+        host = HermesRuntimeHostServices(agent, task_id="synthetic-task")
+
+        with (
+            patch("run_agent.handle_function_call") as dispatch,
+            pytest.raises(RuntimeExecutionError, match="not available in this session"),
+        ):
+            _run_async(host.execute_tool("terminal", {"command": "pwd"}))
+
+        dispatch.assert_not_called()
+
+    def test_runtime_host_services_observe_interrupt_before_dispatch(self, agent):
+        from agent.runtime_dispatch import HermesRuntimeHostServices
+        from model_tools import _run_async
+
+        agent._interrupt_requested = True
+        host = HermesRuntimeHostServices(agent, task_id="synthetic-task")
+
+        with patch("run_agent.handle_function_call") as dispatch:
+            result = _run_async(host.execute_tool("web_search", {"q": "runtime"}))
+
+        dispatch.assert_not_called()
+        assert "cancelled" in result.lower()
+
     def test_single_tool_executed(self, agent):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])

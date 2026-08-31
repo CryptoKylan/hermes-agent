@@ -6,7 +6,7 @@ import copy
 import hashlib
 import json
 from dataclasses import dataclass
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Callable, Mapping, Sequence
 
 from agent.runtime_api import (
@@ -202,13 +202,66 @@ def make_builtin_codex_registration(
 class HermesRuntimeHostServices:
     """The only stateful Hermes surface available to runtime plugins."""
 
-    def __init__(self, agent: Any):
+    def __init__(self, agent: Any, *, task_id: str):
         self._agent = agent
+        self._task_id = str(task_id)
+        self._tool_call_count = 0
+        allowed = set(getattr(agent, "valid_tool_names", ()) or ())
+        for schema in getattr(agent, "tools", ()) or ():
+            if not isinstance(schema, Mapping):
+                continue
+            function = schema.get("function")
+            if isinstance(function, Mapping) and function.get("name"):
+                allowed.add(str(function["name"]))
+        self._allowed_tool_names = frozenset(allowed)
 
     async def execute_tool(self, name: str, arguments: Mapping[str, Any]) -> Any:
-        from tools.registry import registry
+        """Execute one runtime-requested tool through Hermes' canonical funnel.
 
-        return registry.dispatch(name, dict(arguments))
+        The synthetic assistant/tool-call objects are host-private adapters for
+        the existing single-call executor.  That executor owns scope checks,
+        plugin middleware and approval, guardrails, progress, persistence, and
+        terminal result normalization.  The plugin receives only the canonical
+        tool result content.
+        """
+        normalized_name = str(name or "").strip()
+        if not normalized_name or normalized_name not in self._allowed_tool_names:
+            raise RuntimeExecutionError(
+                f"tool '{normalized_name or '<empty>'}' is not available in this session"
+            )
+        if not isinstance(arguments, Mapping):
+            raise RuntimeExecutionError("runtime tool arguments must be a mapping")
+
+        executor = getattr(self._agent, "_execute_tool_calls", None)
+        if not callable(executor):
+            raise RuntimeExecutionError("Hermes tool executor is unavailable")
+
+        self._tool_call_count += 1
+        tool_call_id = f"runtime-tool-{self._tool_call_count:04d}"
+        tool_call = SimpleNamespace(
+            id=tool_call_id,
+            type="function",
+            function=SimpleNamespace(
+                name=normalized_name,
+                arguments=json.dumps(dict(arguments), ensure_ascii=False),
+            ),
+        )
+        assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+        tool_messages: list[Mapping[str, Any]] = []
+        executor(assistant_message, tool_messages, self._task_id)
+
+        matches = [
+            message
+            for message in tool_messages
+            if message.get("role") == "tool"
+            and message.get("tool_call_id") == tool_call_id
+        ]
+        if len(matches) != 1:
+            raise RuntimeExecutionError(
+                "Hermes tool executor did not produce exactly one canonical result"
+            )
+
+        return matches[0].get("content")
 
     async def request_approval(
         self,

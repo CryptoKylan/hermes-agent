@@ -2125,7 +2125,7 @@ def run_conversation(
         dispatched = run_runtime_sync(
             runtime_registration.factory(),
             request,
-            HermesRuntimeHostServices(agent),
+            HermesRuntimeHostServices(agent, task_id=effective_task_id),
         )
         return dict(dispatched.response)
 
