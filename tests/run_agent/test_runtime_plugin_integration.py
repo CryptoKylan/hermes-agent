@@ -88,15 +88,19 @@ def test_external_plugin_runtime_is_selected_before_the_ordinary_model_loop(
     agent._cached_system_prompt = "composed synthetic prompt"
 
     result = agent.run_conversation("hello")
+    second = agent.run_conversation("again")
 
     assert result["final_response"] == "external runtime reply"
+    assert second["final_response"] == "external runtime reply"
     assert counters == {
         "factory": 1,
-        "preflight": 1,
-        "turn": 1,
-        "close": 1,
+        "preflight": 2,
+        "turn": 2,
+        "close": 0,
         "prompt_snapshot": "composed synthetic prompt",
     }
+    agent.release_clients()
+    assert counters["close"] == 1
 
 
 def test_runtime_failure_reaches_host_policy_with_phase_and_replay_classification(
@@ -169,6 +173,8 @@ def test_runtime_failure_reaches_host_policy_with_phase_and_replay_classificatio
     assert result["failure"].phase is RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT
     assert result["replay_safe"] is True
     assert result["error"] == "synthetic transport failure"
+    assert instances[0].close_calls == 0
+    agent.close()
     assert instances[0].close_calls == 1
 
 
@@ -230,4 +236,6 @@ def test_external_plugin_runtime_mode_skips_provider_client(monkeypatch):
     assert agent.client is None
     assert agent._client_kwargs == {}
     assert agent.api_key == ""
-    assert counters == {"factory": 1, "preflight": 1, "turn": 1, "close": 1}
+    assert counters == {"factory": 1, "preflight": 1, "turn": 1, "close": 0}
+    agent.close()
+    assert counters["close"] == 1

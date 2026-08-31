@@ -30,6 +30,7 @@ RUNTIME_API_VERSION = 1
 # A plugin must declare every service that it needs at registration time.
 HOST_RUNTIME_CAPABILITIES: FrozenSet[str] = frozenset(
     {
+        "background_delivery_v1",
         "cancellation_v1",
         "compaction_events_v1",
         "host_approval_v1",
@@ -81,6 +82,38 @@ class RuntimeEventKind(str, Enum):
     COMPLETED = "completed"
     CANCELLED = "cancelled"
     FAILED = "failed"
+
+
+class RuntimeBackgroundOutcome(str, Enum):
+    """Normalized host-facing outcome for a detached runtime result."""
+
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+_MAX_BACKGROUND_RESULT_BYTES = 16_384
+
+
+@dataclass(frozen=True)
+class RuntimeBackgroundResult:
+    """Bounded provider-neutral content emitted after a turn has ended."""
+
+    content: str
+    outcome: RuntimeBackgroundOutcome = RuntimeBackgroundOutcome.COMPLETED
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.content, str):
+            raise TypeError("background result content must be text")
+        if not isinstance(self.outcome, RuntimeBackgroundOutcome):
+            raise TypeError("background result outcome has an unsupported type")
+        normalized = self.content.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not normalized:
+            raise ValueError("background result content must not be empty")
+        if len(normalized.encode("utf-8")) > _MAX_BACKGROUND_RESULT_BYTES:
+            raise ValueError(
+                f"background result content exceeds {_MAX_BACKGROUND_RESULT_BYTES} bytes"
+            )
+        object.__setattr__(self, "content", normalized)
 
 
 @dataclass(frozen=True)
@@ -282,6 +315,11 @@ class RuntimeHostServices(Protocol):
     async def persist_usage(self, receipt: RuntimeUsageReceipt) -> None: ...
 
     async def emit_compaction(self, event: RuntimeCompactionEvent) -> None: ...
+
+    async def emit_background_result(
+        self,
+        result: RuntimeBackgroundResult,
+    ) -> None: ...
 
     def cancellation_requested(self) -> bool: ...
 

@@ -1976,8 +1976,9 @@ def run_conversation(
         resolve_runtime_registration,
     )
     from agent.runtime_dispatch import (
-        HermesRuntimeHostServices,
         build_runtime_turn_request,
+        close_runtime_session,
+        get_runtime_session,
         make_builtin_codex_registration,
         run_runtime_sync,
     )
@@ -2016,6 +2017,8 @@ def run_conversation(
         if runtime_registration is not None
         else None
     )
+    if runtime_registration is None:
+        close_runtime_session(agent)
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -2152,14 +2155,15 @@ def run_conversation(
             session_state=runtime_session_state,
             correlation_id=effective_task_id,
         )
+        runtime_session = get_runtime_session(
+            agent,
+            runtime_registration,
+            task_id=effective_task_id,
+        )
         dispatched = run_runtime_sync(
-            runtime_registration.factory(),
+            runtime_session.runtime,
             request,
-            HermesRuntimeHostServices(
-                agent,
-                task_id=effective_task_id,
-                runtime_id=runtime_registration.descriptor.runtime_id,
-            ),
+            runtime_session.host,
             descriptor=runtime_registration.descriptor,
         )
         if dispatched.failure is not None:

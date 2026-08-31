@@ -1,0 +1,18 @@
+{
+  "runtime_api_version": 1,
+  "capabilities": {
+    "background_delivery_v1": {
+      "consumer": "HermesRuntimeHostServices.emit_background_result",
+      "result_type": "RuntimeBackgroundResult",
+      "lifecycle": "parent_session",
+      "delivery_owner": "host"
+    },
+    "cancellation_v1": {},
+    "compaction_events_v1": {},
+    "host_approval_v1": {},
+    "host_status_v1": {},
+    "host_tool_execution_v1": {},
+    "runtime_state_v1": {},
+    "usage_receipts_v1": {}
+  }
+}

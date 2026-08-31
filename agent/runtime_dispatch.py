@@ -6,6 +6,9 @@ import asyncio
 import copy
 import hashlib
 import json
+import threading
+import time
+import uuid
 from dataclasses import dataclass
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Callable, Mapping, Sequence
@@ -14,6 +17,8 @@ from agent.runtime_api import (
     AgentRuntime,
     CompactionOwnership,
     RuntimeApprovalRequestEvent,
+    RuntimeBackgroundOutcome,
+    RuntimeBackgroundResult,
     RuntimeCancelledEvent,
     RuntimeCompactionEvent,
     RuntimeCompletedEvent,
@@ -241,6 +246,29 @@ async def _collect_runtime_turn(
         # A task cancellation is a terminal runtime outcome. It never implies
         # replay safety: no provider/runtime exception is used to authorize a
         # host fallback.
+        # If the runtime already emitted its terminal event, preserve it:
+        # cancellation while the async generator unwinds must not create a
+        # second terminal outcome for the same turn.
+        if isinstance(terminal, RuntimeCompletedEvent):
+            return RuntimeDispatchResult(
+                response=terminal.result or {},
+                events=tuple(events),
+                terminal=terminal,
+            )
+        if isinstance(terminal, RuntimeFailedEvent):
+            return RuntimeDispatchResult(
+                response={},
+                events=tuple(events),
+                terminal=terminal,
+                failure=terminal.failure,
+            )
+        if isinstance(terminal, RuntimeCancelledEvent):
+            return RuntimeDispatchResult(
+                response={},
+                events=tuple(events),
+                terminal=terminal,
+                cancelled=True,
+            )
         terminal = RuntimeCancelledEvent(reason="runtime task cancelled")
         events.append(terminal)
         return RuntimeDispatchResult(
@@ -273,22 +301,6 @@ async def _collect_runtime_turn(
             terminal=terminal,
             failure=failure,
         )
-    finally:
-        # The collector is the lifecycle owner: one dispatch means exactly one
-        # close attempt, regardless of preflight, cancellation, failure, or a
-        # malformed event stream. A close error must not erase the classified
-        # turn outcome already returned above.
-        try:
-            await runtime.close()
-        except asyncio.CancelledError:
-            # Cancellation of cleanup itself must not erase the turn's
-            # already-classified terminal outcome.
-            pass
-        except Exception:
-            # Closing is best-effort at this boundary. Runtime implementations
-            # must remain disposable even when their transport has already
-            # failed, and a cleanup exception must not trigger a second close.
-            pass
 
 
 def run_runtime_sync(
@@ -327,6 +339,10 @@ class BuiltInCodexRuntime:
     async def close(self) -> None:
         return None
 
+    def refresh_runner(self, runner: Callable[[], Mapping[str, Any]]) -> None:
+        """Refresh the per-turn host callback without replacing the session runtime."""
+        self._runner = runner
+
 
 def make_builtin_codex_registration(
     runner: Callable[[], Mapping[str, Any]],
@@ -356,6 +372,12 @@ class HermesRuntimeHostServices:
         self._agent = agent
         self._task_id = str(task_id)
         self._runtime_id = str(runtime_id)
+        self._parent_session_id = str(getattr(agent, "session_id", None) or "")
+        self._closed = False
+        self._delivery_lock = threading.Lock()
+        self._delivery_counter = 0
+        self._route: dict[str, str] = {}
+        self.refresh_turn(task_id)
         self._tool_call_count = 0
         self._compaction_events: list[dict[str, Any]] = []
         try:
@@ -372,6 +394,33 @@ class HermesRuntimeHostServices:
             if isinstance(function, Mapping) and function.get("name"):
                 allowed.add(str(function["name"]))
         self._allowed_tool_names = frozenset(allowed)
+
+    def refresh_turn(self, task_id: str) -> None:
+        """Refresh per-turn correlation and route data for the bound parent only."""
+        current_parent = str(getattr(self._agent, "session_id", None) or "")
+        if current_parent != self._parent_session_id:
+            raise RuntimeExecutionError(
+                "runtime host binding cannot move to a different Hermes session"
+            )
+        self._task_id = str(task_id)
+        try:
+            from gateway.session_context import get_session_env
+
+            self._route = {
+                event_key: get_session_env(env_name, "")
+                for event_key, env_name in (
+                    ("session_key", "HERMES_SESSION_KEY"),
+                    ("origin_ui_session_id", "HERMES_UI_SESSION_ID"),
+                    ("platform", "HERMES_SESSION_PLATFORM"),
+                    ("chat_type", "HERMES_SESSION_CHAT_TYPE"),
+                    ("chat_id", "HERMES_SESSION_CHAT_ID"),
+                    ("thread_id", "HERMES_SESSION_THREAD_ID"),
+                    ("user_id", "HERMES_SESSION_USER_ID"),
+                    ("scope_id", "HERMES_SESSION_SCOPE_ID"),
+                )
+            }
+        except Exception:
+            self._route = {}
 
     async def execute_tool(self, name: str, arguments: Mapping[str, Any]) -> Any:
         """Execute one runtime-requested tool through Hermes' canonical funnel.
@@ -516,5 +565,147 @@ class HermesRuntimeHostServices:
         # details or provider-specific policy.
         await self.emit_status(f"Runtime compaction {event.phase.value}")
 
+    async def emit_background_result(
+        self,
+        result: RuntimeBackgroundResult,
+    ) -> None:
+        """Queue a detached result on Hermes' existing host delivery rail."""
+        if not isinstance(result, RuntimeBackgroundResult):
+            raise RuntimeExecutionError("background result has an unsupported type")
+        if not self._parent_session_id:
+            raise RuntimeExecutionError(
+                "background delivery requires an active Hermes parent session"
+            )
+        from tools.process_registry import process_registry
+
+        with self._delivery_lock:
+            if self._closed:
+                raise RuntimeExecutionError("runtime host binding is closed")
+            self._delivery_counter += 1
+            delivery_id = (
+                f"runtime-background-{self._delivery_counter:04d}-{uuid.uuid4().hex}"
+            )
+            now = time.time()
+            completed = result.outcome is RuntimeBackgroundOutcome.COMPLETED
+            event = {
+                # Reuse the existing async-completion consumer. Legacy events
+                # without a durable delegation row are already supported: the
+                # gateway/TUI claim, exact-parent target preflight, busy-session
+                # requeue, transcript turn, and adapter retry paths stay host-owned.
+                "type": "async_delegation",
+                "delegation_id": delivery_id,
+                "dispatched_at": now,
+                "completed_at": now,
+                "parent_session_id": self._parent_session_id,
+                "goal": "runtime background work",
+                "role": "runtime",
+                "model": "host-routed",
+                "status": "completed" if completed else "failed",
+                "summary": result.content if completed else None,
+                "error": None if completed else result.content,
+                "api_calls": 0,
+                "duration_seconds": 0,
+                **{key: value for key, value in self._route.items() if value},
+            }
+            process_registry.completion_queue.put(event)
+
+    async def close(self) -> None:
+        """Reject future background emissions from the retired parent binding."""
+        with self._delivery_lock:
+            self._closed = True
+
     def cancellation_requested(self) -> bool:
         return bool(getattr(self._agent, "_interrupt_requested", False))
+
+
+class RuntimeSessionBinding:
+    """One runtime and host-services binding owned by one Hermes parent session."""
+
+    def __init__(
+        self,
+        *,
+        runtime: AgentRuntime,
+        host: HermesRuntimeHostServices,
+        descriptor: RuntimeDescriptor,
+        plugin_id: str,
+        parent_session_id: str,
+    ):
+        self.runtime = runtime
+        self.host = host
+        self.descriptor = descriptor
+        self.plugin_id = plugin_id
+        self.parent_session_id = parent_session_id
+        self._closed = False
+        self._close_lock = threading.Lock()
+
+    def close(self) -> None:
+        """Close the host gate and runtime exactly once."""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        async def _close() -> None:
+            await self.host.close()
+            try:
+                await self.runtime.close()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        from model_tools import _run_async
+
+        _run_async(_close())
+
+
+def get_runtime_session(
+    agent: Any,
+    registration: RuntimeRegistration,
+    *,
+    task_id: str,
+) -> RuntimeSessionBinding:
+    """Return the exact-parent runtime binding, creating it once per session."""
+    parent_session_id = str(getattr(agent, "session_id", None) or "")
+    existing = getattr(agent, "_runtime_session_binding", None)
+    if isinstance(existing, RuntimeSessionBinding):
+        same_identity = (
+            existing.parent_session_id == parent_session_id
+            and existing.descriptor == registration.descriptor
+            and existing.plugin_id == registration.plugin_id
+        )
+        if same_identity:
+            if isinstance(existing.runtime, BuiltInCodexRuntime):
+                candidate = registration.factory()
+                if isinstance(candidate, BuiltInCodexRuntime):
+                    existing.runtime.refresh_runner(candidate._runner)
+            existing.host.refresh_turn(task_id)
+            return existing
+        close_runtime_session(agent)
+
+    runtime = registration.factory()
+    host = HermesRuntimeHostServices(
+        agent,
+        task_id=task_id,
+        runtime_id=registration.descriptor.runtime_id,
+    )
+    binding = RuntimeSessionBinding(
+        runtime=runtime,
+        host=host,
+        descriptor=registration.descriptor,
+        plugin_id=registration.plugin_id,
+        parent_session_id=parent_session_id,
+    )
+    agent._runtime_session_binding = binding
+    return binding
+
+
+def close_runtime_session(agent: Any) -> None:
+    """Detach and close an agent's cached runtime binding exactly once."""
+    binding = getattr(agent, "_runtime_session_binding", None)
+    if binding is None:
+        return
+    agent._runtime_session_binding = None
+    close = getattr(binding, "close", None)
+    if callable(close):
+        close()
