@@ -124,12 +124,39 @@ def test_runtime_registration_is_removed_when_plugin_unloads():
     assert manager.get_agent_runtime("example-runtime") is None
 
 
+def test_provider_profile_registration_is_removed_when_plugin_unloads():
+    from providers import get_provider_profile, register_provider
+    from providers.base import ProviderProfile
+
+    context, manager = _make_context()
+    profile = ProviderProfile(
+        name="example-runtime-provider",
+        aliases=("example-runtime-alias",),
+        display_name="Example runtime",
+        description="Whole-turn runtime test profile",
+        api_mode="agent_runtime",
+        auth_type="oauth_external",
+    )
+
+    # Match module-shaped entry-point discovery: import-time registration of
+    # the same object is adopted by register(ctx), then owned by the ledger.
+    register_provider(profile)
+    context.register_provider_profile(profile)
+    assert get_provider_profile(profile.name) is profile
+    assert get_provider_profile("example-runtime-alias") is profile
+
+    assert manager.unload("runtime-plugin") is True
+    assert get_provider_profile(profile.name) is None
+    assert get_provider_profile("example-runtime-alias") is None
+
+
 def test_host_manifest_exports_only_versioned_concrete_capabilities():
     manifest = runtime_api_manifest()
 
     assert manifest["runtime_api_version"] == RUNTIME_API_VERSION
     assert manifest["host_capabilities"] == sorted(HOST_RUNTIME_CAPABILITIES)
     assert "host_tool_execution_v1" in manifest["host_capabilities"]
+    assert "provider_profile_registration_v1" in manifest["host_capabilities"]
     assert all(capability.endswith("_v1") for capability in manifest["host_capabilities"])
 
 

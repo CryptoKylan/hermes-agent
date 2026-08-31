@@ -3262,6 +3262,46 @@ class PluginContext:
         )
 
     @_serialized_replacement
+    def register_provider_profile(self, profile: Any) -> PluginRegistration:
+        """Register a declarative model-provider profile for this plugin.
+
+        Pip entry-point discovery may import a module-shaped plugin before its
+        ``register(ctx)`` hook runs. When that import already installed the
+        same profile object, this method adopts ownership of that registration
+        so targeted unload or uninstall removes it with the runtime.
+        """
+        from providers import (
+            register_provider,
+            restore_registration,
+            snapshot_registration,
+        )
+        from providers.base import ProviderProfile
+
+        if not isinstance(profile, ProviderProfile):
+            raise TypeError("provider profile must be a ProviderProfile")
+
+        previous = snapshot_registration(profile.name)
+        # The module-shaped entry point may have self-registered this exact
+        # object during import. Adopt it instead of restoring it on unload.
+        replacement = None if previous is profile else previous
+        register_provider(profile)
+        if snapshot_registration(profile.name) is not profile:
+            raise RuntimeError(f"provider profile {profile.name!r} was not retained")
+
+        return self._track_replacement(
+            "provider_profile",
+            profile.name,
+            slot=("provider_profile", profile.name),
+            current=profile,
+            previous=replacement,
+            restore=lambda prior: restore_registration(
+                profile.name,
+                profile,
+                prior,
+            ),
+        )
+
+    @_serialized_replacement
     def register_auxiliary_task(
         self,
         key: str,

@@ -71,8 +71,12 @@ fallback policy remain host-owned.
 ## Decision
 
 Hermes exports `RUNTIME_API_VERSION = 1` and a concrete set of host capability
-identifiers. The existing `hermes_agent.plugins` loader receives one additive
-`PluginContext.register_agent_runtime()` method. No second loader is added.
+identifiers. The existing `hermes_agent.plugins` loader receives additive
+`PluginContext.register_agent_runtime()` and
+`PluginContext.register_provider_profile()` methods. The latter owns the
+declarative selector through the existing unload ledger, so removing a runtime
+plugin cannot leave a selectable provider profile without its runtime. No
+second loader is added.
 
 Registration accepts a frozen `RuntimeDescriptor` and a zero-argument runtime
 factory. Registration validates the descriptor before the factory is retained
@@ -84,7 +88,8 @@ and registration.
 The plugin runtime registry is profile-scoped through the existing
 plugin-manager scope. The built-in Codex runtime is supplied by host bootstrap
 as a `RuntimeRegistration` and resolved together with plugin registrations by
-the same pure resolver. Unloading a plugin disposes its runtime registration.
+the same pure resolver. Unloading a plugin disposes both its runtime and owned
+provider-profile registrations.
 A clean host with no matching third-party runtime continues through the
 ordinary Hermes conversation loop unchanged.
 
