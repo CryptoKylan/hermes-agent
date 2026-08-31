@@ -170,3 +170,64 @@ def test_runtime_failure_reaches_host_policy_with_phase_and_replay_classificatio
     assert result["replay_safe"] is True
     assert result["error"] == "synthetic transport failure"
     assert instances[0].close_calls == 1
+
+
+def test_external_plugin_runtime_mode_skips_provider_client(monkeypatch):
+    manager = PluginManager()
+    manager._discovered = True
+    context = PluginContext(PluginManifest(name="synthetic-runtime"), manager)
+    counters = {"factory": 0, "preflight": 0, "turn": 0, "close": 0}
+
+    class _Runtime(_ExternalRuntime):
+        async def run_turn(self, request, host):
+            self._counters["turn"] += 1
+            yield RuntimeCompletedEvent(
+                result={
+                    "final_response": "synthetic runtime reply",
+                    "messages": list(request.messages),
+                }
+            )
+
+    def factory():
+        counters["factory"] += 1
+        return _Runtime(counters)
+
+    context.register_agent_runtime(
+        descriptor=RuntimeDescriptor(
+            runtime_id="synthetic-runtime",
+            plugin_version="0.1.0",
+            runtime_api_min=RUNTIME_API_VERSION,
+            runtime_api_max=RUNTIME_API_VERSION,
+            required_host_capabilities=frozenset({"cancellation_v1"}),
+            provider_ids=frozenset({"synthetic-runtime-provider"}),
+            api_modes=frozenset({"agent_runtime"}),
+            session_state_schema_version=1,
+        ),
+        factory=factory,
+    )
+
+    import hermes_cli.plugins as plugins_module
+
+    monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+    def fail_client(*_args, **_kwargs):
+        raise AssertionError("agent_runtime must not construct a provider client")
+
+    monkeypatch.setattr(run_agent.AIAgent, "_create_openai_client", fail_client)
+    agent = run_agent.AIAgent(
+        base_url="runtime://synthetic",
+        provider="synthetic-runtime-provider",
+        model="synthetic-model",
+        api_mode="agent_runtime",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._cached_system_prompt = "composed synthetic prompt"
+
+    result = agent.run_conversation("hello")
+
+    assert result["final_response"] == "synthetic runtime reply"
+    assert agent.client is None
+    assert agent._client_kwargs == {}
+    assert agent.api_key == ""
+    assert counters == {"factory": 1, "preflight": 1, "turn": 1, "close": 1}

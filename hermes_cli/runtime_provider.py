@@ -432,6 +432,9 @@ _VALID_API_MODES = {
     "codex_responses",
     "anthropic_messages",
     "bedrock_converse",
+    # Provider-neutral whole-turn runtime. The selected runtime owns the
+    # model interaction, so this mode must never enter a provider SDK path.
+    "agent_runtime",
     # Optional opt-in: hand the entire turn to a `codex app-server` subprocess
     # so terminal/file-ops/patching/sandboxing run inside Codex's own runtime
     # instead of Hermes' tool dispatch. Gated behind config key
@@ -456,6 +459,63 @@ def _parse_api_mode(raw: Any) -> Optional[str]:
         if normalized in _VALID_API_MODES:
             return normalized
     return None
+
+
+def _resolve_agent_runtime_profile(
+    *,
+    requested_provider: str,
+    model_cfg: Dict[str, Any],
+    explicit_base_url: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Resolve a provider profile that delegates the whole turn to a runtime.
+
+    Provider profiles are the existing discovery surface for independently
+    packaged providers. A profile declaring ``agent_runtime`` has no API
+    endpoint or credential contract for Hermes to resolve; the selected
+    runtime is responsible for its own authentication. Keep this check before
+    the ordinary provider resolver so a missing profile credential cannot make
+    a whole-turn runtime fall through to another provider.
+    """
+    requested_norm = str(requested_provider or "").strip().lower()
+    if not requested_norm or requested_norm in {"auto", "custom"}:
+        return None
+
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(requested_norm)
+    except Exception:
+        return None
+    if profile is None:
+        return None
+    if _parse_api_mode(getattr(profile, "api_mode", None)) != "agent_runtime":
+        return None
+
+    provider = str(getattr(profile, "name", "") or requested_norm).strip().lower()
+    configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+    configured_base_url = ""
+    if configured_provider in {requested_norm, provider}:
+        configured_base_url = str(model_cfg.get("base_url") or "").strip()
+    base_url = (
+        str(explicit_base_url or "").strip()
+        or configured_base_url
+        or str(getattr(profile, "base_url", "") or "").strip()
+    ).rstrip("/")
+    if not base_url:
+        # The CLI keeps a non-empty endpoint in its runtime snapshot even
+        # when the selected runtime has no network endpoint. This structural
+        # sentinel is never opened as a provider connection.
+        base_url = f"runtime://{provider}"
+    return {
+        "provider": provider,
+        "api_mode": "agent_runtime",
+        "base_url": base_url,
+        # No SDK client consumes this field for agent_runtime. Keep the
+        # structural value empty rather than copying any ambient credential.
+        "api_key": "",
+        "source": "provider-profile",
+        "requested_provider": requested_provider,
+    }
 
 
 def _nous_inference_base_url_override() -> str:
@@ -1260,6 +1320,25 @@ def _resolve_named_custom_runtime(
     if not base_url:
         return None
 
+    configured_mode = _parse_api_mode(custom_provider.get("api_mode"))
+    if configured_mode == "agent_runtime":
+        result: Dict[str, Any] = {
+            "provider": "custom",
+            "api_mode": configured_mode,
+            "base_url": base_url,
+            # Whole-turn runtimes own their authentication and never pass
+            # this value to an ordinary provider client.
+            "api_key": "",
+            "source": f"custom_provider:{custom_provider.get('name', requested_provider)}",
+            "requested_provider": requested_provider,
+        }
+        if target_model:
+            result["model"] = target_model
+        elif custom_provider.get("model"):
+            result["model"] = custom_provider["model"]
+        _lift_model_capabilities(custom_provider, result.get("model"), result)
+        return result
+
     # Check if a credential pool exists for this custom endpoint
     pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
     if pool_result:
@@ -1912,6 +1991,15 @@ def resolve_runtime_provider(
                 f"provider {requested_provider!r} is disabled in config "
                 f"(providers.{requested_provider}.enabled: false)"
             )
+
+    model_cfg = _get_model_config()
+    profile_runtime = _resolve_agent_runtime_profile(
+        requested_provider=requested_provider,
+        model_cfg=model_cfg,
+        explicit_base_url=explicit_base_url,
+    )
+    if profile_runtime is not None:
+        return profile_runtime
 
     if requested_provider == "moa":
         return {
