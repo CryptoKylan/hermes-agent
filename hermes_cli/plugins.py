@@ -3210,6 +3210,58 @@ class PluginContext:
     # -- auxiliary task registration ---------------------------------------
 
     @_serialized_replacement
+    def register_agent_runtime(
+        self,
+        *,
+        descriptor: Any,
+        factory: Callable[[], Any],
+    ) -> PluginRegistration:
+        """Register a compatible whole-turn runtime without instantiating it.
+
+        Compatibility is validated before the factory is retained.  That
+        ordering guarantees an unsupported plugin cannot resolve credentials,
+        start a subprocess, or issue a model query during registration.
+        """
+        from agent.runtime_api import (
+            RuntimeRegistration,
+            RuntimeRegistrationError,
+            validate_runtime_descriptor,
+        )
+
+        validate_runtime_descriptor(descriptor)
+        if not callable(factory):
+            raise RuntimeRegistrationError("runtime factory must be callable")
+
+        runtime_id = descriptor.runtime_id
+        owner_id = self.plugin_id
+        existing = self._manager._agent_runtimes.get(runtime_id)
+        if existing is not None and existing.plugin_id != owner_id:
+            raise RuntimeRegistrationError(
+                f"runtime {runtime_id!r} is already registered by "
+                f"plugin {existing.plugin_id!r}"
+            )
+
+        entry = RuntimeRegistration(
+            descriptor=descriptor,
+            factory=factory,
+            plugin_id=owner_id,
+        )
+        self._manager._agent_runtimes[runtime_id] = entry
+        return self._track_replacement(
+            "agent_runtime",
+            runtime_id,
+            slot=("manager_mapping", id(self._manager._agent_runtimes), runtime_id),
+            current=entry,
+            previous=existing,
+            restore=lambda replacement: self._manager._restore_mapping(
+                self._manager._agent_runtimes,
+                runtime_id,
+                entry,
+                replacement,
+            ),
+        )
+
+    @_serialized_replacement
     def register_auxiliary_task(
         self,
         key: str,
@@ -3763,6 +3815,9 @@ class PluginManager:
         # Plugin-registered auxiliary tasks: key → {key, display_name,
         # description, defaults, plugin}. See PluginContext.register_auxiliary_task.
         self._aux_tasks: Dict[str, Dict[str, Any]] = {}
+        # Whole-turn runtimes are profile-scoped and owned by the same plugin
+        # lifecycle ledger as tools, hooks, and auxiliary tasks.
+        self._agent_runtimes: Dict[str, Any] = {}
         # Explicitly-selected, profile-scoped human approval transports.
         self._approval_transports: Dict[str, Any] = {}
         # Inter-plugin event bus. Subscriptions are owner-tagged ledger entries
@@ -4176,6 +4231,7 @@ class PluginManager:
             self._plugin_skills.clear()
             self._portable_mcp_servers.clear()
             self._aux_tasks.clear()
+            self._agent_runtimes.clear()
             self._system_prompt_sections.clear()
             self._approval_transports.clear()
             self._slack_action_handlers.clear()
@@ -4201,6 +4257,29 @@ class PluginManager:
     def has_gateway_message_injector(self) -> bool:
         """Return whether a live gateway can accept plugin-triggered turns."""
         return self._gateway_message_injector is not None
+
+    def get_agent_runtime(self, runtime_id: str) -> Any:
+        """Return registration metadata without creating the runtime."""
+        return self._agent_runtimes.get(runtime_id)
+
+    def select_agent_runtime(self, selection: Any) -> Any:
+        """Select one compatible runtime using descriptor-only routing."""
+        matches = [
+            registration
+            for registration in self._agent_runtimes.values()
+            if registration.descriptor.supports(selection)
+        ]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            from agent.runtime_api import RuntimeRegistrationError
+
+            runtime_ids = sorted(item.descriptor.runtime_id for item in matches)
+            raise RuntimeRegistrationError(
+                "multiple runtimes support the same selection: "
+                + ", ".join(runtime_ids)
+            )
+        return matches[0]
 
     def set_gateway_message_injector(
         self,

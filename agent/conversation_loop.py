@@ -2083,13 +2083,37 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
-            user_message=user_message,
-            original_user_message=original_user_message,
-            messages=messages,
-            effective_task_id=effective_task_id,
-            should_review_memory=_should_review_memory,
+        from agent.runtime_dispatch import (
+            BuiltInCodexRuntime,
+            HermesRuntimeHostServices,
+            build_runtime_turn_request,
+            run_runtime_sync,
         )
+
+        request = build_runtime_turn_request(
+            provider=agent.provider,
+            model=agent.model,
+            api_mode=agent.api_mode,
+            messages=messages,
+            prompt_snapshot=getattr(agent, "system_prompt", "") or "",
+            tool_schemas=getattr(agent, "tools", ()) or (),
+            correlation_id=effective_task_id,
+        )
+        runtime = BuiltInCodexRuntime(
+            lambda: agent._run_codex_app_server_turn(
+                user_message=user_message,
+                original_user_message=original_user_message,
+                messages=messages,
+                effective_task_id=effective_task_id,
+                should_review_memory=_should_review_memory,
+            )
+        )
+        dispatched = run_runtime_sync(
+            runtime,
+            request,
+            HermesRuntimeHostServices(agent),
+        )
+        return dict(dispatched.response)
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
