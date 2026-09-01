@@ -116,22 +116,27 @@ def _constrain_failure_to_host_evidence(
     *,
     side_effects_at_turn_start: int,
 ) -> RuntimeFailure:
-    """Prevent runtime replay claims from contradicting host-observed effects."""
+    """Prevent runtime replay claims from contradicting host-observed evidence."""
 
     host_side_effects = getattr(host, "_side_effect_count", 0)
     side_effect_observed = host_side_effects > side_effects_at_turn_start or any(
         isinstance(event, _RUNTIME_SIDE_EFFECT_EVENT_TYPES) for event in events
     )
-    if not side_effect_observed:
+    if side_effect_observed:
+        constrained_phase = RuntimeFailurePhase.AFTER_SIDE_EFFECTS
+    elif any(isinstance(event, _RUNTIME_VISIBLE_EVENT_TYPES) for event in events):
+        constrained_phase = (
+            failure.phase
+            if failure.phase is RuntimeFailurePhase.AFTER_SIDE_EFFECTS
+            else RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT
+        )
+    else:
         return failure
-    if (
-        failure.phase is RuntimeFailurePhase.AFTER_SIDE_EFFECTS
-        and not failure.replay_safe
-    ):
+    if failure.phase is constrained_phase and not failure.replay_safe:
         return failure
     return replace(
         failure,
-        phase=RuntimeFailurePhase.AFTER_SIDE_EFFECTS,
+        phase=constrained_phase,
         replay_safe=False,
     )
 

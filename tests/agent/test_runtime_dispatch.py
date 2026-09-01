@@ -18,6 +18,7 @@ from agent.runtime_api import (
     RuntimeCompactionPhase,
     CompactionOwnership,
     RuntimeCompletedEvent,
+    RuntimeContentEvent,
     RuntimeEventKind,
     RuntimeFailedEvent,
     RuntimeFailure,
@@ -532,6 +533,61 @@ def test_dispatch_returns_classified_failure_without_authorizing_fallback():
     assert result.replay_safe is False
     assert isinstance(result.terminal, RuntimeFailedEvent)
     assert runtime.close_calls == 0
+
+
+@pytest.mark.parametrize(
+    "visible_event",
+    (
+        pytest.param(RuntimeContentEvent(text="visible content"), id="content"),
+        pytest.param(RuntimeStatusEvent(message="visible status"), id="status"),
+        pytest.param(
+            RuntimeToolRequestEvent(
+                request_id="tool-1",
+                name="synthetic_tool",
+                arguments={"value": "one"},
+            ),
+            id="tool-request",
+        ),
+        pytest.param(
+            RuntimeApprovalRequestEvent(
+                request_id="approval-1",
+                action="synthetic_action",
+                details={"value": "one"},
+            ),
+            id="approval-request",
+        ),
+    ),
+)
+def test_visible_runtime_event_overrides_replay_safe_failure_claim(visible_event):
+    class _ReplayClaimingRuntime:
+        def preflight(self, request):
+            return None
+
+        async def run_turn(self, request, host) -> AsyncIterator[object]:
+            yield visible_event
+            yield RuntimeFailedEvent(
+                failure=RuntimeFailure(
+                    code="synthetic_failure",
+                    message="synthetic failure",
+                    phase=RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT,
+                    replay_safe=True,
+                    retryable=True,
+                )
+            )
+
+        async def close(self):
+            return None
+
+    result = run_runtime_sync(_ReplayClaimingRuntime(), _request(), _HostServices())
+
+    assert result.failure is not None
+    assert result.failure.phase is RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT
+    assert result.failure.replay_safe is False
+    assert result.failure.retryable is True
+    assert result.replay_safe is False
+    assert isinstance(result.terminal, RuntimeFailedEvent)
+    assert result.terminal.failure is result.failure
+    assert result.events[-1] is result.terminal
 
 
 def test_host_tool_execution_overrides_runtime_replay_safe_claim():
